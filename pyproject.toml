@@ -1,0 +1,33 @@
+[build-system]
+# 使用最常见的 setuptools 构建后端，避免为这次小工程化补强引入额外复杂度。
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# 项目元数据当前主要服务于依赖声明与 CI 安装，不额外展开打包发布配置。
+name = "fda-antivib"
+version = "0.1.0"
+description = "带自动有效扫描范围确认的白光扫描干涉 FDA/PhaseGap 分析桌面项目"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    # 核心数值与频谱计算依赖。
+    "finufft",
+    "numpy",
+    "scipy",
+    # GUI 与绘图依赖。
+    "matplotlib",
+    "Pillow",
+    "PySide6",
+]
+
+[project.optional-dependencies]
+# 测试依赖单独放到可选分组，方便 CI 和本地按需安装。
+test = [
+    "pytest>=8",
+    "pytest-qt>=4.4",
+]
+
+[tool.setuptools.packages.find]
+# 当前仓库只有 `app` 包需要被 setuptools 识别。
+include = ["app*"]
