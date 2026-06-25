@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_dynamic_libs
+
 
 ROOT = Path(SPECPATH).resolve().parent
 
@@ -15,7 +17,7 @@ hiddenimports = [
 a = Analysis(
     [str(ROOT / "main.py")],
     pathex=[],
-    binaries=[],
+    binaries=collect_dynamic_libs("finufft"),
     datas=[(str(ROOT / "assets" / "app_icon.ico"), "assets")],
     hiddenimports=hiddenimports,
     hookspath=[],
