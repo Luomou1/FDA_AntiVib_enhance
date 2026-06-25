@@ -19,6 +19,8 @@ dependencies = [
     "matplotlib",
     "Pillow",
     "PySide6",
+    "pyvista",
+    "pyvistaqt",
 ]
 
 [project.optional-dependencies]

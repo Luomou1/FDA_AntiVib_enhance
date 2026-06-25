@@ -3,10 +3,12 @@ from __future__ import annotations
 from typing import Callable
 
 import numpy as np
+import pyvista as pv
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-from PySide6.QtGui import QGuiApplication
-from PySide6.QtWidgets import QSizePolicy
+from PySide6.QtGui import QCloseEvent, QGuiApplication, QShowEvent
+from PySide6.QtWidgets import QSizePolicy, QVBoxLayout, QWidget
+from pyvistaqt import QtInteractor
 
 
 def downsample_for_preview(data: np.ndarray, max_points: int = 128) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -64,6 +66,44 @@ def _ensure_nonzero_limits(lower: float, upper: float, minimum_span: float = 1.0
     # 这里按“数值量级 + 最小兜底跨度”补一个很小的 padding，让显示稳定但不改数据本身。
     half_span = max(abs(lower) * 0.05, abs(upper) * 0.05, float(minimum_span) / 2.0, 1e-6)
     return lower - half_span, upper + half_span
+
+
+def _combined_finite_bounds(*arrays: np.ndarray) -> tuple[float, float]:
+    """计算多组表面的公共有限值范围，平面数据也返回稳定的非零跨度。"""
+    minima: list[float] = []
+    maxima: list[float] = []
+    for array in arrays:
+        finite_values = np.asarray(array, dtype=np.float64)
+        finite_values = finite_values[np.isfinite(finite_values)]
+        if finite_values.size:
+            minima.append(float(np.min(finite_values)))
+            maxima.append(float(np.max(finite_values)))
+    if not minima:
+        return -0.5, 0.5
+    return _ensure_nonzero_limits(min(minima), max(maxima))
+
+
+def build_normalized_surface_grid(
+    data: np.ndarray,
+    max_points: int = 96,
+    z_bounds: tuple[float, float] | None = None,
+) -> tuple[pv.StructuredGrid, np.ndarray, np.ndarray, np.ndarray, tuple[float, float]]:
+    """将表面归一化到固定单位坐标盒，同时保留原始坐标和值用于刻度和着色。"""
+    reduced, x_coords, y_coords = downsample_for_preview(np.asarray(data), max_points=max_points)
+    resolved_z_bounds = _combined_finite_bounds(reduced) if z_bounds is None else _ensure_nonzero_limits(*z_bounds)
+    z_lower, z_upper = resolved_z_bounds
+    display_values = np.nan_to_num(
+        reduced.astype(np.float32),
+        nan=z_lower,
+        posinf=z_upper,
+        neginf=z_lower,
+    )
+    z_normalized = np.clip((display_values - z_lower) / (z_upper - z_lower), 0.0, 1.0)
+    x_normalized = np.linspace(0.0, 1.0, display_values.shape[1], dtype=np.float32)
+    y_normalized = np.linspace(0.0, 1.0, display_values.shape[0], dtype=np.float32)
+    xx, yy = np.meshgrid(x_normalized, y_normalized)
+    grid = pv.StructuredGrid(xx, yy, z_normalized)
+    return grid, display_values, x_coords, y_coords, resolved_z_bounds
 
 
 class _InteractiveCanvas(FigureCanvasQTAgg):
@@ -231,197 +271,228 @@ class SpectrumCanvas(_InteractiveCanvas):
         self.draw_idle()
 
 
-class SurfaceCanvas(_InteractiveCanvas):
-    def __init__(self) -> None:
-        super().__init__(projection="3d")
-        self._x_coords: np.ndarray | None = None
-        self._y_coords: np.ndarray | None = None
-        self._z_values: np.ndarray | None = None
-        self.mpl_connect("button_press_event", self._on_click)
-        self.mpl_connect("scroll_event", self._on_scroll)
+class _PyVistaPreview(QWidget):
+    """封装 PyVista Qt 预览控件，保持主窗口调用接口稳定。"""
 
-    def draw_surface(self, data: np.ndarray, title: str) -> None:
-        reduced, x_coords, y_coords = downsample_for_preview(np.asarray(data), max_points=64)
-        self.axes.clear()
-        xx, yy = np.meshgrid(x_coords, y_coords)
-        self.axes.plot_surface(xx, yy, reduced, cmap="viridis", linewidth=0, antialiased=False)
-        self.axes.set_title(title)
-        self.axes.set_xlabel("X (pixels)")
-        self.axes.set_ylabel("Y (pixels)")
-        self.axes.set_zlabel("Height (nm)")
-        z_min = float(np.nanmin(reduced))
-        z_max = float(np.nanmax(reduced))
-        # 对平坦表面先扩成一个极小但非零的 z 轴范围，避免 identical zlims warning。
-        z_limits = _ensure_nonzero_limits(z_min, z_max)
-        self.axes.set_box_aspect(
-            _box_aspect_from_limits(
+    def __init__(self) -> None:
+        """创建嵌入式 PyVista 场景，并准备统一的回调字段。"""
+        super().__init__()
+        self._info_callback: Callable[[str], None] | None = None
+        self._pixel_callback: Callable[[dict[str, float]], None] | None = None
+        self._shutdown = False
+        # QtInteractor 默认每 200ms 自动刷新一次。Windows 下窗口隐藏、显示器切换或
+        # OpenGL 上下文短暂失效后，该定时器仍会调用 MakeCurrent，导致日志持续刷屏。
+        self.plotter = QtInteractor(self, auto_update=False)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        # pyvistaqt 不同版本暴露的 Qt 控件字段略有差异，这里优先使用官方示例里的 interactor。
+        layout.addWidget(getattr(self.plotter, "interactor", self.plotter))
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def set_info_callback(self, callback: Callable[[str], None]) -> None:
+        """记录读数回调，供复制视图和绘制完成状态同步使用。"""
+        self._info_callback = callback
+
+    def set_pixel_callback(self, callback: Callable[[dict[str, float]], None]) -> None:
+        """保留与二维画布一致的接口，后续需要点选三维表面时可直接接入。"""
+        self._pixel_callback = callback
+
+    def _emit_info(self, text: str) -> None:
+        """把 PyVista 场景状态推送到主窗口读数区。"""
+        if self._info_callback is not None:
+            self._info_callback(text)
+
+    def copy_current_view_to_clipboard(self) -> None:
+        """复制当前 PyVista Qt 控件截图，命令行为与 Matplotlib 画布一致。"""
+        pixmap = self.grab()
+        QGuiApplication.clipboard().setPixmap(pixmap)
+        self._emit_info("当前视图已复制到剪贴板")
+
+    def reset_view(self) -> None:
+        """恢复固定单位坐标盒的默认等轴测视角。"""
+        if self._shutdown:
+            return
+        self._set_default_camera()
+        self._render_if_visible()
+
+    def _set_default_camera(self) -> None:
+        """只更新相机参数，不强制隐藏页签立即渲染。"""
+        self.plotter.view_isometric()
+        self.plotter.reset_camera(bounds=(0.0, 1.0, 0.0, 1.0, 0.0, 1.0), render=False)
+        self.plotter.camera.zoom(1.16)
+
+    def _render_if_visible(self) -> None:
+        """仅在控件可见且渲染器仍有效时执行一次显式渲染。"""
+        if self._shutdown or not self.isVisible():
+            return
+        try:
+            if getattr(self.plotter, "_closed", False) or getattr(self.plotter, "render_window", None) is None:
+                return
+            self.plotter.render()
+        except (AttributeError, RuntimeError):
+            # Qt/VTK 对象可能在窗口关闭事件中先于 Python 包装对象销毁。
+            return
+
+    def showEvent(self, event: QShowEvent) -> None:
+        """页签真正显示时再渲染，避免隐藏页签争用 OpenGL 上下文。"""
+        super().showEvent(event)
+        self._render_if_visible()
+
+    def shutdown(self) -> None:
+        """停止所有后台渲染并幂等释放 VTK/Qt 资源。"""
+        if self._shutdown:
+            return
+        self._shutdown = True
+        render_timer = getattr(self.plotter, "render_timer", None)
+        if render_timer is not None:
+            render_timer.stop()
+        try:
+            self.plotter.suppress_rendering = True
+            self.plotter.close()
+        except (AttributeError, RuntimeError):
+            return
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """控件关闭时显式释放 OpenGL 上下文。"""
+        self.shutdown()
+        super().closeEvent(event)
+
+    def _prepare_scene(self, title: str) -> None:
+        """清空并设置统一的浅色技术预览场景。"""
+        self.plotter.clear()
+        self.plotter.set_background("#f8fafc")
+        self.plotter.add_text(title, position="upper_left", font_size=10, color="#111827")
+
+    def _make_surface_grid(
+        self,
+        data: np.ndarray,
+        max_points: int = 96,
+        z_bounds: tuple[float, float] | None = None,
+    ) -> tuple[pv.StructuredGrid, np.ndarray, np.ndarray, np.ndarray, tuple[float, float]]:
+        """把高度矩阵降采样并放入固定坐标盒，不改变原始结果数据。"""
+        return build_normalized_surface_grid(data, max_points=max_points, z_bounds=z_bounds)
+
+    def _show_fixed_bounds(
+        self,
+        x_coords: np.ndarray,
+        y_coords: np.ndarray,
+        z_bounds: tuple[float, float],
+    ) -> None:
+        """显示固定大小的坐标盒，并用原始数据范围标注刻度。"""
+        self.plotter.show_bounds(
+            bounds=(0.0, 1.0, 0.0, 1.0, 0.0, 1.0),
+            axes_ranges=(
                 float(x_coords[0]),
                 float(x_coords[-1]),
                 float(y_coords[0]),
                 float(y_coords[-1]),
-                z_limits[0],
-                z_limits[1],
+                float(z_bounds[0]),
+                float(z_bounds[1]),
+            ),
+            xtitle="X (pixels)",
+            ytitle="Y (pixels)",
+            ztitle="Height",
+            grid="back",
+            location="outer",
+            all_edges=True,
+            color="#64748b",
+            font_size=10,
+            n_xlabels=4,
+            n_ylabels=4,
+            n_zlabels=5,
+        )
+
+
+class SurfaceCanvas(_PyVistaPreview):
+    """使用 PyVista 绘制单张三维高度表面。"""
+
+    def __init__(self) -> None:
+        """初始化单表面预览所需的缓存字段。"""
+        super().__init__()
+        self._x_coords: np.ndarray | None = None
+        self._y_coords: np.ndarray | None = None
+        self._z_values: np.ndarray | None = None
+
+    def draw_surface(self, data: np.ndarray, title: str) -> None:
+        """将高度矩阵渲染为 PyVista 三维表面预览。"""
+        if self._shutdown:
+            return
+        grid, display_values, x_coords, y_coords, z_bounds = self._make_surface_grid(data)
+        self.plotter.suppress_rendering = True
+        try:
+            self._prepare_scene(title)
+            self.plotter.add_mesh(
+                grid,
+                scalars=display_values.ravel(order="F"),
+                cmap="viridis",
+                smooth_shading=True,
+                show_scalar_bar=True,
+                scalar_bar_args={
+                    "vertical": False,
+                    "position_x": 0.22,
+                    "position_y": 0.03,
+                    "width": 0.58,
+                    "height": 0.08,
+                    "title": "",
+                },
             )
-        )
-        self.axes.set_xlim3d(float(x_coords[0]), float(x_coords[-1]))
-        self.axes.set_ylim3d(float(y_coords[0]), float(y_coords[-1]))
-        self.axes.set_zlim3d(*z_limits)
-        self._default_limits = (
-            (float(x_coords[0]), float(x_coords[-1])),
-            (float(y_coords[0]), float(y_coords[-1])),
-            z_limits,
-            (self.axes.elev, self.axes.azim),
-        )
+            self.plotter.show_axes()
+            self._show_fixed_bounds(x_coords, y_coords, z_bounds)
+            self._set_default_camera()
+        finally:
+            self.plotter.suppress_rendering = False
+        self._render_if_visible()
         self._x_coords = x_coords
         self._y_coords = y_coords
-        self._z_values = reduced
-        self.draw_idle()
-
-    def _on_click(self, event) -> None:
-        if (
-            event.inaxes is not self.axes
-            or self._x_coords is None
-            or self._y_coords is None
-            or self._z_values is None
-            or event.xdata is None
-            or event.ydata is None
-        ):
-            return
-        x_index = int(np.argmin(np.abs(self._x_coords - event.xdata)))
-        y_index = int(np.argmin(np.abs(self._y_coords - event.ydata)))
-        x_value = float(self._x_coords[x_index])
-        y_value = float(self._y_coords[y_index])
-        z_value = float(self._z_values[y_index, x_index])
-        self._emit_info(f"x={int(round(x_value))}, y={int(round(y_value))}, z={z_value:.6f}")
-        self._emit_pixel({"x": x_value, "y": y_value, "value": z_value})
-
-    def _on_scroll(self, event) -> None:
-        if event.inaxes is not self.axes:
-            return
-        scale = 0.8 if event.button == "up" else 1.25
-        x_left, x_right = self.axes.get_xlim3d()
-        y_bottom, y_top = self.axes.get_ylim3d()
-        z_bottom, z_top = self.axes.get_zlim3d()
-        x_center = (x_left + x_right) / 2.0
-        y_center = (y_bottom + y_top) / 2.0
-        z_center = (z_bottom + z_top) / 2.0
-        new_x = _clamp_limits(*_zoom_limits(x_left, x_right, x_center, scale), *self._default_limits[0])
-        new_y = _clamp_limits(*_zoom_limits(y_bottom, y_top, y_center, scale), *self._default_limits[1])
-        new_z = _clamp_limits(*_zoom_limits(z_bottom, z_top, z_center, scale), *self._default_limits[2])
-        self.axes.set_xlim3d(*new_x)
-        self.axes.set_ylim3d(*new_y)
-        self.axes.set_zlim3d(*new_z)
-        self.axes.set_box_aspect(_box_aspect_from_limits(*new_x, *new_y, *new_z))
-        self.draw_idle()
-
-    def reset_view(self) -> None:
-        if self._default_limits is None:
-            return
-        self.axes.set_xlim3d(*self._default_limits[0])
-        self.axes.set_ylim3d(*self._default_limits[1])
-        self.axes.set_zlim3d(*self._default_limits[2])
-        self.axes.view_init(*self._default_limits[3])
-        self.axes.set_box_aspect(_box_aspect_from_limits(*self._default_limits[0], *self._default_limits[1], *self._default_limits[2]))
-        self.draw_idle()
+        self._z_values = display_values
+        self._emit_info(f"x范围={int(x_coords[0])}-{int(x_coords[-1])}, y范围={int(y_coords[0])}-{int(y_coords[-1])}")
 
 
-class ComparisonCanvas(_InteractiveCanvas):
+class ComparisonCanvas(_PyVistaPreview):
+    """使用 PyVista 叠加显示校正前后的两张高度表面。"""
+
     def __init__(self) -> None:
-        super().__init__(projection="3d")
+        """初始化双表面对比预览所需的缓存字段。"""
+        super().__init__()
         self._x_coords: np.ndarray | None = None
         self._y_coords: np.ndarray | None = None
         self._h_values: np.ndarray | None = None
         self._hp_values: np.ndarray | None = None
-        self.mpl_connect("button_press_event", self._on_click)
-        self.mpl_connect("scroll_event", self._on_scroll)
 
     def draw_comparison(self, height_map: np.ndarray, height_map_prime: np.ndarray, title: str) -> None:
-        reduced_h, x_coords, y_coords = downsample_for_preview(np.asarray(height_map), max_points=64)
-        reduced_hp, _, _ = downsample_for_preview(np.asarray(height_map_prime), max_points=64)
-        self.axes.clear()
-        xx, yy = np.meshgrid(x_coords, y_coords)
-        self.axes.plot_surface(xx, yy, reduced_h, color="#1f77b4", alpha=0.6, linewidth=0, antialiased=False)
-        self.axes.plot_surface(xx, yy, reduced_hp, color="#d94841", alpha=0.6, linewidth=0, antialiased=False)
-        self.axes.set_title(title)
-        self.axes.set_xlabel("X (pixels)")
-        self.axes.set_ylabel("Y (pixels)")
-        self.axes.set_zlabel("Height (nm)")
-        z_min = min(float(np.nanmin(reduced_h)), float(np.nanmin(reduced_hp)))
-        z_max = max(float(np.nanmax(reduced_h)), float(np.nanmax(reduced_hp)))
-        # 对比图也可能出现两张表面都完全平坦的情况，这里复用同一套兜底逻辑。
-        z_limits = _ensure_nonzero_limits(z_min, z_max)
-        self.axes.set_xlim3d(float(x_coords[0]), float(x_coords[-1]))
-        self.axes.set_ylim3d(float(y_coords[0]), float(y_coords[-1]))
-        self.axes.set_zlim3d(*z_limits)
-        self.axes.set_box_aspect(
-            _box_aspect_from_limits(
-                float(x_coords[0]),
-                float(x_coords[-1]),
-                float(y_coords[0]),
-                float(y_coords[-1]),
-                z_limits[0],
-                z_limits[1],
+        """将 h 与 h_prime 以半透明 PyVista 表面叠加预览。"""
+        if self._shutdown:
+            return
+        z_bounds = _combined_finite_bounds(height_map, height_map_prime)
+        h_grid, h_values, x_coords, y_coords, _ = self._make_surface_grid(height_map, z_bounds=z_bounds)
+        hp_grid, hp_values, _, _, _ = self._make_surface_grid(height_map_prime, z_bounds=z_bounds)
+        self.plotter.suppress_rendering = True
+        try:
+            self._prepare_scene(title)
+            self.plotter.add_mesh(
+                h_grid,
+                color="#2563eb",
+                opacity=0.62,
+                smooth_shading=True,
+                label="h",
             )
-        )
-        self._default_limits = (
-            (float(x_coords[0]), float(x_coords[-1])),
-            (float(y_coords[0]), float(y_coords[-1])),
-            z_limits,
-            (self.axes.elev, self.axes.azim),
-        )
+            self.plotter.add_mesh(
+                hp_grid,
+                color="#dc2626",
+                opacity=0.58,
+                smooth_shading=True,
+                label="h_prime",
+            )
+            self.plotter.add_legend(face="rectangle", bcolor="#ffffff", border=True)
+            self.plotter.show_axes()
+            self._show_fixed_bounds(x_coords, y_coords, z_bounds)
+            self._set_default_camera()
+        finally:
+            self.plotter.suppress_rendering = False
+        self._render_if_visible()
         self._x_coords = x_coords
         self._y_coords = y_coords
-        self._h_values = reduced_h
-        self._hp_values = reduced_hp
-        self.draw_idle()
-
-    def _on_click(self, event) -> None:
-        if (
-            event.inaxes is not self.axes
-            or self._x_coords is None
-            or self._y_coords is None
-            or self._h_values is None
-            or self._hp_values is None
-            or event.xdata is None
-            or event.ydata is None
-        ):
-            return
-        x_index = int(np.argmin(np.abs(self._x_coords - event.xdata)))
-        y_index = int(np.argmin(np.abs(self._y_coords - event.ydata)))
-        x_value = float(self._x_coords[x_index])
-        y_value = float(self._y_coords[y_index])
-        h_value = float(self._h_values[y_index, x_index])
-        hp_value = float(self._hp_values[y_index, x_index])
-        self._emit_info(
-            f"x={int(round(x_value))}, y={int(round(y_value))}, h={h_value:.6f}, h_prime={hp_value:.6f}"
-        )
-        self._emit_pixel({"x": x_value, "y": y_value, "h": h_value, "h_prime": hp_value})
-
-    def _on_scroll(self, event) -> None:
-        if event.inaxes is not self.axes:
-            return
-        scale = 0.8 if event.button == "up" else 1.25
-        x_left, x_right = self.axes.get_xlim3d()
-        y_bottom, y_top = self.axes.get_ylim3d()
-        z_bottom, z_top = self.axes.get_zlim3d()
-        x_center = (x_left + x_right) / 2.0
-        y_center = (y_bottom + y_top) / 2.0
-        z_center = (z_bottom + z_top) / 2.0
-        new_x = _clamp_limits(*_zoom_limits(x_left, x_right, x_center, scale), *self._default_limits[0])
-        new_y = _clamp_limits(*_zoom_limits(y_bottom, y_top, y_center, scale), *self._default_limits[1])
-        new_z = _clamp_limits(*_zoom_limits(z_bottom, z_top, z_center, scale), *self._default_limits[2])
-        self.axes.set_xlim3d(*new_x)
-        self.axes.set_ylim3d(*new_y)
-        self.axes.set_zlim3d(*new_z)
-        self.axes.set_box_aspect(_box_aspect_from_limits(*new_x, *new_y, *new_z))
-        self.draw_idle()
-
-    def reset_view(self) -> None:
-        if self._default_limits is None:
-            return
-        self.axes.set_xlim3d(*self._default_limits[0])
-        self.axes.set_ylim3d(*self._default_limits[1])
-        self.axes.set_zlim3d(*self._default_limits[2])
-        self.axes.view_init(*self._default_limits[3])
-        self.axes.set_box_aspect(_box_aspect_from_limits(*self._default_limits[0], *self._default_limits[1], *self._default_limits[2]))
-        self.draw_idle()
+        self._h_values = h_values
+        self._hp_values = hp_values
+        self._emit_info("h 与 h_prime 三维对比已更新")

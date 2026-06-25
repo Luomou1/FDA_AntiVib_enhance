@@ -35,7 +35,11 @@ def _phase_to_cycles(values: np.ndarray) -> np.ndarray:
 def _h_prime_title_suffix(result: AnalysisResult) -> str:
     """根据当前工作流决定 h_prime 图题后缀。"""
     method = str(result.extras.get("phase_gap_method", "FDA"))
-    return "FDA级次修正" if method.upper() == "FDA" else "PhaseGap最终"
+    if method.upper() == "FDA":
+        return "FDA级次修正"
+    if method.upper() == "GFDA":
+        return "GFDA非均匀级次修正"
+    return "PhaseGap最终"
 
 
 def save_paper_figures(
@@ -117,3 +121,5 @@ def save_paper_figures(
             figure_paths["comparison_3d"] = path_3d
 
     return figure_paths
+
+

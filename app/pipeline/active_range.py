@@ -42,18 +42,26 @@ def detect_active_range(cube: np.ndarray, max_pixels: int = 120_000, window: int
 def apply_active_range(
     cube: np.ndarray,
     positions: np.ndarray | None = None,
-    expansion_frames: int = 0,
+    left_expansion_frames: int = 0,
+    right_expansion_frames: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None, ActiveRangeResult]:
     """检测并裁剪 cube；若传入非均匀采样位置，同步裁剪位置数组。"""
     result = detect_active_range(cube)
     if not result.is_valid:
         return cube, positions, result
+    left_margin = max(0, int(left_expansion_frames))
+    right_margin = left_margin if right_expansion_frames is None else max(0, int(right_expansion_frames))
     expanded_range = expand_active_range(
         (result.start_frame, result.end_frame),
         frame_count=int(cube.shape[2]),
-        expansion_frames=expansion_frames,
+        left_expansion_frames=left_margin,
+        right_expansion_frames=right_margin,
     )
     if expanded_range != (result.start_frame, result.end_frame):
+        if left_margin == right_margin:
+            reason = f"{result.reason}，左右各扩展 {left_margin} 帧"
+        else:
+            reason = f"{result.reason}，左扩展 {left_margin} 帧，右扩展 {right_margin} 帧"
         result = ActiveRangeResult(
             start_frame=expanded_range[0],
             end_frame=expanded_range[1],
@@ -61,7 +69,7 @@ def apply_active_range(
             score=result.score,
             threshold=result.threshold,
             is_valid=result.is_valid,
-            reason=f"{result.reason}，左右各扩展 {int(expansion_frames)} 帧",
+            reason=reason,
         )
     return apply_known_active_range(cube, positions, expanded_range, result)
 
@@ -69,12 +77,14 @@ def apply_active_range(
 def expand_active_range(
     active_range: tuple[int, int],
     frame_count: int,
-    expansion_frames: int,
+    left_expansion_frames: int,
+    right_expansion_frames: int | None = None,
 ) -> tuple[int, int]:
-    """按 1-based 帧号向左右扩展有效范围，并自动裁剪到数据边界内。"""
-    margin = max(0, int(expansion_frames))
-    start_frame = max(1, int(active_range[0]) - margin)
-    end_frame = min(int(frame_count), int(active_range[1]) + margin)
+    """按 1-based 帧号独立扩展有效范围左右边界，并自动裁剪到数据边界内。"""
+    left_margin = max(0, int(left_expansion_frames))
+    right_margin = left_margin if right_expansion_frames is None else max(0, int(right_expansion_frames))
+    start_frame = max(1, int(active_range[0]) - left_margin)
+    end_frame = min(int(frame_count), int(active_range[1]) + right_margin)
     return start_frame, max(start_frame, end_frame)
 
 

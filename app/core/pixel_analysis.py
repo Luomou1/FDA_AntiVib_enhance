@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import numpy as np
 
+from app.core.adaptive_window import build_analysis_window
 from app.core.kernel import (
     _build_k_axis,
-    _build_window,
     _compute_nonuniform_uniform_grid_spectrum,
     _prepare_local_phase_window,
     _resolve_optical_positions_um,
@@ -79,7 +79,7 @@ def build_pixel_analysis(
     y: int,
     step_size: float,
     start_height: float = 0.0,
-    unwrap_method: str = "pda",
+    unwrap_method: str = "itoh",
     window_size: int = 9,
     fitting_method: str = "weighted",
     global_k0_index: int | None = None,
@@ -87,7 +87,7 @@ def build_pixel_analysis(
     sample_positions_um: np.ndarray | None = None,
     window_name: str = "hamming",
     window_alpha: float = 0.5,
-    zero_padding_mode: str = "next_power_of_two",
+    zero_padding_mode: str = "fixed_512",
 ) -> dict[str, np.ndarray | int]:
     """
     生成某个像素的完整分析剖面。
@@ -110,7 +110,7 @@ def build_pixel_analysis(
         signal_x = _validate_sample_positions(sample_positions_um, signal_raw.shape[0]).astype(np.float32)
 
     # 单点频谱同样做加窗，减少泄漏带来的峰值偏移。
-    window = _build_window(window_name, signal_dc.shape[0], window_alpha=window_alpha)
+    window = build_analysis_window(signal_dc[None, :], window_name, window_alpha=window_alpha)[0]
     signal_windowed = signal_dc * window
     fft_length = resolve_fft_length(signal_windowed.shape[0], zero_padding_mode)
     if sample_positions_um is None:
@@ -201,6 +201,8 @@ def build_pixel_analysis(
         "signal_x": signal_x,
         "signal_raw_y": signal_raw,
         "signal_dc_y": signal_dc,
+        "window_y": window.astype(np.float32),
+        "signal_windowed_y": signal_windowed.astype(np.float32),
         "k_x": k_x,
         "amplitude_y": amplitude,
         "k0_x": k0_x,

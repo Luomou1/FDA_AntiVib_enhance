@@ -11,22 +11,55 @@ import matplotlib as mpl
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
-from PySide6.QtWidgets import QLabel, QMainWindow, QTabWidget, QVBoxLayout, QWidget
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QMainWindow, QPushButton, QSpinBox, QTabWidget, QVBoxLayout, QWidget
 
 from app.gui.mpl_font import configure_matplotlib_fonts
 
 FONT_PROP = configure_matplotlib_fonts()
 TAU = 2.0 * np.pi
 
+PROFILE_TITLES = {
+    "phi0_map": "相位剖面",
+    "theta_map": "相干剖面",
+    "final_height_phase_map": "最终高度剖面（以相位为单位）",
+    "phase_gap_raw": "未连接相位差",
+    "phase_gap_final": "最终相位差",
+}
+
+PROFILE_YLABELS = {
+    "phi0_map": "相位 (cycles)",
+    "theta_map": "相位 (cycles)",
+    "final_height_phase_map": "相位 (cycles)",
+    "phase_gap_raw": "相位差 (cycles)",
+    "phase_gap_final": "相位差 (cycles)",
+}
+
+
+def _set_index_xlim(axes, point_count: int) -> None:
+    """让像素索引横轴严格覆盖 0 到最后一个数据点，不保留自动边距。"""
+    axes.set_xlim(0.0, float(max(int(point_count) - 1, 1)))
+
+
+class NoWheelSpinBox(QSpinBox):
+    """坐标输入框：保留键盘和按钮调值，但忽略鼠标滚轮。"""
+
+    def wheelEvent(self, event) -> None:
+        event.ignore()
+
 
 class FringeProfileWindow(QMainWindow):
     """承载条纹级次 X/Y 双向剖面的独立窗口。"""
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
         self.setWindowTitle("条纹级次剖面")
+        self.setWindowFlag(Qt.Tool, True)
         self._tab_pages: dict[str, QWidget] = {}
         self._single_profile_colors: dict[str, str] = {}
+        self._current_source_map: np.ndarray | None = None
+        self._current_layer_key = "fringe_order_map"
+        self._current_diagnostic_maps: dict[str, np.ndarray] | None = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -37,6 +70,7 @@ class FringeProfileWindow(QMainWindow):
 
         self.header_label = QLabel("请先在条纹级次图上点击一个像素点")
         layout.addWidget(self.header_label)
+        layout.addWidget(self._build_coordinate_panel())
 
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs, 1)
@@ -58,14 +92,14 @@ class FringeProfileWindow(QMainWindow):
         self._single_profile_canvases: dict[str, FigureCanvasQTAgg] = {}
         self._single_profile_axes: dict[tuple[str, str], object] = {}
         self._single_profile_summary_labels: dict[str, QLabel] = {}
-        for key, tab_title, color in (
-            ("phi0_map", "phase profile", "#6a4c93"),
-            ("theta_map", "Coherence Profile", "#2c7a7b"),
-            ("final_height_phase_map", "Final Height Profile (in units of phase)", "#4f772d"),
-            ("phase_gap_raw", "Disconnected Phase Gap", "#1f77b4"),
-            ("phase_gap_final", "Final Phase Gap", "#d97706"),
+        for key, color in (
+            ("phi0_map", "#6a4c93"),
+            ("theta_map", "#2c7a7b"),
+            ("final_height_phase_map", "#4f772d"),
+            ("phase_gap_raw", "#1f77b4"),
+            ("phase_gap_final", "#d97706"),
         ):
-            self._build_single_profile_tab(key=key, tab_title=tab_title, color=color)
+            self._build_single_profile_tab(key=key, tab_title=PROFILE_TITLES[key], color=color)
 
         diagnostic_page = QWidget()
         diagnostic_layout = QVBoxLayout(diagnostic_page)
@@ -114,6 +148,61 @@ class FringeProfileWindow(QMainWindow):
         multi_profile_layout.addWidget(self.multi_profile_toolbar)
         multi_profile_layout.addWidget(self.multi_profile_canvas, 1)
         self.tabs.addTab(multi_profile_page, "多图层剖面")
+
+    def _build_coordinate_panel(self) -> QWidget:
+        """构建坐标输入区，允许直接跳转到指定像素。"""
+        panel = QWidget()
+        layout = QHBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        title_label = QLabel("像素坐标")
+        self.x_coordinate_spin = NoWheelSpinBox()
+        self.x_coordinate_spin.setPrefix("X ")
+        self.x_coordinate_spin.setRange(0, 0)
+        self.x_coordinate_spin.setEnabled(False)
+        self.y_coordinate_spin = NoWheelSpinBox()
+        self.y_coordinate_spin.setPrefix("Y ")
+        self.y_coordinate_spin.setRange(0, 0)
+        self.y_coordinate_spin.setEnabled(False)
+        self.jump_to_pixel_button = QPushButton("查看像素")
+        self.jump_to_pixel_button.setEnabled(False)
+        self.jump_to_pixel_button.clicked.connect(self._jump_to_coordinate)
+        self.coordinate_status_label = QLabel("输入坐标后会刷新该像素的剖面和诊断信息")
+        self.coordinate_status_label.setWordWrap(True)
+
+        layout.addWidget(title_label, 0)
+        layout.addWidget(self.x_coordinate_spin, 0)
+        layout.addWidget(self.y_coordinate_spin, 0)
+        layout.addWidget(self.jump_to_pixel_button, 0)
+        layout.addWidget(self.coordinate_status_label, 1)
+        return panel
+
+    def _sync_coordinate_panel(self, shape: tuple[int, int], x: int, y: int, point_value: float) -> None:
+        """根据当前图像尺寸同步坐标输入范围和值。"""
+        rows, cols = shape
+        self.x_coordinate_spin.setEnabled(True)
+        self.y_coordinate_spin.setEnabled(True)
+        self.jump_to_pixel_button.setEnabled(True)
+        self.x_coordinate_spin.setRange(0, max(cols - 1, 0))
+        self.y_coordinate_spin.setRange(0, max(rows - 1, 0))
+        self.x_coordinate_spin.setValue(x)
+        self.y_coordinate_spin.setValue(y)
+        self.coordinate_status_label.setText(
+            f"当前像素: X={x}, Y={y}, value={self._format_value(point_value)}"
+        )
+
+    def _jump_to_coordinate(self) -> None:
+        """按输入的 X/Y 坐标刷新当前像素的所有剖面和诊断信息。"""
+        if self._current_source_map is None:
+            return
+        self.update_profiles(
+            source_map=self._current_source_map,
+            x=self.x_coordinate_spin.value(),
+            y=self.y_coordinate_spin.value(),
+            layer_key=self._current_layer_key,
+            diagnostic_maps=self._current_diagnostic_maps,
+        )
 
     def _build_single_profile_tab(self, key: str, tab_title: str, color: str) -> None:
         """为单个图层创建独立的 X/Y 双剖面页。"""
@@ -215,8 +304,8 @@ class FringeProfileWindow(QMainWindow):
             fontproperties=FONT_PROP,
             fontsize=10,
         )
-        axes.set_xlabel("Local X (pixels)", fontproperties=FONT_PROP)
-        axes.set_ylabel("Local Y (pixels)", fontproperties=FONT_PROP)
+        axes.set_xlabel("X位置(像素)", fontproperties=FONT_PROP)
+        axes.set_ylabel("Y位置(像素)", fontproperties=FONT_PROP)
         self.diagnostic_figure.colorbar(image, ax=axes, fraction=0.046, pad=0.03)
 
         point_value = float(data[y, x])
@@ -248,13 +337,13 @@ class FringeProfileWindow(QMainWindow):
             coords = np.arange(data.shape[1], dtype=np.int32)
             values = data[y, :]
             focus_index = x
-            xlabel = "X (pixels)"
+            xlabel = "X位置(像素)"
             direction_label = f"X 向（第 {y} 行）"
         else:
             coords = np.arange(data.shape[0], dtype=np.int32)
             values = data[:, x]
             focus_index = y
-            xlabel = "Y (pixels)"
+            xlabel = "Y位置(像素)"
             direction_label = f"Y 向（第 {x} 列）"
 
         point_value = float(values[focus_index])
@@ -262,15 +351,11 @@ class FringeProfileWindow(QMainWindow):
         axes.plot(coords, values, color=color, linewidth=1.3)
         axes.scatter([focus_index], [point_value], color="#d94841", zorder=3, s=28)
         axes.axvline(focus_index, color="#d94841", linestyle="--", linewidth=1.0)
-        axes.set_title(f"{title} {direction_label}", fontproperties=FONT_PROP, fontsize=10)
+        display_title = PROFILE_TITLES.get(key, title)
+        axes.set_title(f"{display_title} {direction_label}", fontproperties=FONT_PROP, fontsize=10)
         axes.set_xlabel(xlabel, fontproperties=FONT_PROP)
-        ylabel_map = {
-            "phi0_map": "Phase (cycles)",
-            "theta_map": "Coherence (cycles)",
-            "phase_gap_raw": "Phase Gap (cycles)",
-            "phase_gap_final": "Phase Gap (cycles)",
-        }
-        axes.set_ylabel(ylabel_map.get(key, title), fontproperties=FONT_PROP)
+        axes.set_ylabel(PROFILE_YLABELS.get(key, display_title), fontproperties=FONT_PROP)
+        _set_index_xlim(axes, values.size)
         axes.grid(True, linestyle="--", alpha=0.35)
         return f"{key}_{axis_name}={self._format_value(point_value)}"
 
@@ -290,28 +375,14 @@ class FringeProfileWindow(QMainWindow):
         point_value = float(data[y, x])
 
         if layer_key == "fringe_order_map":
-            title = "Fringe Order Map"
-            ylabel = "Fringe Order (order)"
+            title = "条纹级次图"
+            ylabel = "条纹级次 (order)"
             color_x = "#1f77b4"
             color_y = "#2c7a7b"
             use_step = True
         else:
-            title_map = {
-                "phi0_map": "phase profile",
-                "theta_map": "Coherence Profile",
-                "final_height_phase_map": "Final Height Profile (in units of phase)",
-                "phase_gap_raw": "Disconnected Phase Gap",
-                "phase_gap_final": "Final Phase Gap",
-            }
-            ylabel_map = {
-                "phi0_map": "Phase (cycles)",
-                "theta_map": "Coherence (cycles)",
-                "final_height_phase_map": "Phase (cycles)",
-                "phase_gap_raw": "Phase Gap (cycles)",
-                "phase_gap_final": "Phase Gap (cycles)",
-            }
-            title = title_map.get(layer_key, layer_key)
-            ylabel = ylabel_map.get(layer_key, title)
+            title = PROFILE_TITLES.get(layer_key, layer_key)
+            ylabel = PROFILE_YLABELS.get(layer_key, title)
             color_x = self._single_profile_colors.get(layer_key, "#1f77b4")
             color_y = color_x
             use_step = False
@@ -329,15 +400,17 @@ class FringeProfileWindow(QMainWindow):
         self.x_axes.scatter([x], [point_value], color="#d94841", zorder=3, s=36)
         self.x_axes.axvline(x, color="#d94841", linestyle="--", linewidth=1.0)
         self.x_axes.set_title(f"{title} X 向剖面（第 {y} 行）", fontproperties=FONT_PROP)
-        self.x_axes.set_xlabel("X (pixels)", fontproperties=FONT_PROP)
+        self.x_axes.set_xlabel("X位置(像素)", fontproperties=FONT_PROP)
         self.x_axes.set_ylabel(ylabel, fontproperties=FONT_PROP)
+        _set_index_xlim(self.x_axes, row_profile.size)
         self.x_axes.grid(True, linestyle="--", alpha=0.35)
 
         self.y_axes.scatter([y], [point_value], color="#d94841", zorder=3, s=36)
         self.y_axes.axvline(y, color="#d94841", linestyle="--", linewidth=1.0)
         self.y_axes.set_title(f"{title} Y 向剖面（第 {x} 列）", fontproperties=FONT_PROP)
-        self.y_axes.set_xlabel("Y (pixels)", fontproperties=FONT_PROP)
+        self.y_axes.set_xlabel("Y位置(像素)", fontproperties=FONT_PROP)
         self.y_axes.set_ylabel(ylabel, fontproperties=FONT_PROP)
+        _set_index_xlim(self.y_axes, col_profile.size)
         self.y_axes.grid(True, linestyle="--", alpha=0.35)
         self.canvas.draw_idle()
 
@@ -378,23 +451,18 @@ class FringeProfileWindow(QMainWindow):
         x_axes.scatter([x], [point_value], color="#d94841", zorder=3, s=28)
         x_axes.axvline(x, color="#d94841", linestyle="--", linewidth=1.0)
         x_axes.set_title(f"{title} X 向剖面（第 {y} 行）", fontproperties=FONT_PROP)
-        x_axes.set_xlabel("X (pixels)", fontproperties=FONT_PROP)
-        ylabel_map = {
-            "phi0_map": "Phase (cycles)",
-            "theta_map": "Coherence (cycles)",
-            "final_height_phase_map": "Phase (cycles)",
-            "phase_gap_raw": "Phase Gap (cycles)",
-            "phase_gap_final": "Phase Gap (cycles)",
-        }
-        x_axes.set_ylabel(ylabel_map.get(key, title), fontproperties=FONT_PROP)
+        x_axes.set_xlabel("X位置(像素)", fontproperties=FONT_PROP)
+        x_axes.set_ylabel(PROFILE_YLABELS.get(key, title), fontproperties=FONT_PROP)
+        _set_index_xlim(x_axes, row_profile.size)
         x_axes.grid(True, linestyle="--", alpha=0.35)
 
         y_axes.plot(y_coords, col_profile, color=color, linewidth=1.3)
         y_axes.scatter([y], [point_value], color="#d94841", zorder=3, s=28)
         y_axes.axvline(y, color="#d94841", linestyle="--", linewidth=1.0)
         y_axes.set_title(f"{title} Y 向剖面（第 {x} 列）", fontproperties=FONT_PROP)
-        y_axes.set_xlabel("Y (pixels)", fontproperties=FONT_PROP)
-        y_axes.set_ylabel(ylabel_map.get(key, title), fontproperties=FONT_PROP)
+        y_axes.set_xlabel("Y位置(像素)", fontproperties=FONT_PROP)
+        y_axes.set_ylabel(PROFILE_YLABELS.get(key, title), fontproperties=FONT_PROP)
+        _set_index_xlim(y_axes, col_profile.size)
         y_axes.grid(True, linestyle="--", alpha=0.35)
 
         summary_label.setText(
@@ -417,6 +485,10 @@ class FringeProfileWindow(QMainWindow):
         x = int(np.clip(x, 0, data.shape[1] - 1))
         y = int(np.clip(y, 0, data.shape[0] - 1))
         point_value = float(data[y, x])
+        self._current_source_map = data
+        self._current_layer_key = layer_key
+        self._current_diagnostic_maps = diagnostic_maps
+        self._sync_coordinate_panel(data.shape, x=x, y=y, point_value=point_value)
 
         self.header_label.setText(
             f"当前图层: {layer_key} | 当前点: x={x}, y={y}, value={self._format_value(point_value)}"
@@ -489,16 +561,44 @@ class FringeProfileWindow(QMainWindow):
         self.multi_profile_summary_label.setText(" | ".join(multi_profile_summary))
         self.multi_profile_canvas.draw_idle()
 
-        self._draw_single_profile_tab("phi0_map", "phase profile", diagnostic_maps, x=x, y=y, color="#6a4c93")
-        self._draw_single_profile_tab("theta_map", "Coherence Profile", diagnostic_maps, x=x, y=y, color="#2c7a7b")
+        self._draw_single_profile_tab(
+            "phi0_map",
+            PROFILE_TITLES["phi0_map"],
+            diagnostic_maps,
+            x=x,
+            y=y,
+            color="#6a4c93",
+        )
+        self._draw_single_profile_tab(
+            "theta_map",
+            PROFILE_TITLES["theta_map"],
+            diagnostic_maps,
+            x=x,
+            y=y,
+            color="#2c7a7b",
+        )
         self._draw_single_profile_tab(
             "final_height_phase_map",
-            "Final Height Profile (in units of phase)",
+            PROFILE_TITLES["final_height_phase_map"],
             diagnostic_maps,
             x=x,
             y=y,
             color="#4f772d",
         )
-        self._draw_single_profile_tab("phase_gap_raw", "Disconnected Phase Gap", diagnostic_maps, x=x, y=y, color="#1f77b4")
-        self._draw_single_profile_tab("phase_gap_final", "Final Phase Gap", diagnostic_maps, x=x, y=y, color="#d97706")
+        self._draw_single_profile_tab(
+            "phase_gap_raw",
+            PROFILE_TITLES["phase_gap_raw"],
+            diagnostic_maps,
+            x=x,
+            y=y,
+            color="#1f77b4",
+        )
+        self._draw_single_profile_tab(
+            "phase_gap_final",
+            PROFILE_TITLES["phase_gap_final"],
+            diagnostic_maps,
+            x=x,
+            y=y,
+            color="#d97706",
+        )
         self.tabs.setCurrentWidget(self._tab_pages.get(layer_key, self._tab_pages["fringe_order_map"]))

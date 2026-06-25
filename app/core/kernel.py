@@ -21,15 +21,123 @@ import finufft
 from scipy.fft import rfft
 from scipy.ndimage import uniform_filter1d
 from scipy.signal import find_peaks, peak_prominences
+
+from app.core.adaptive_window import build_analysis_window, build_static_window, normalize_window_name
+
 FFT_SIZE = 512
 NUFFT_EPS = 1e-6
 
 
-def resolve_fft_length(sample_count: int, zero_padding_mode: str = "next_power_of_two") -> int:
+class NonuniformNufftContext:
+    """在一次非均匀采样分析内复用节点和 FINUFFT Type-1 计划。
+
+    同一组数据的所有像素共享同一条 OPD 坐标，因此节点归一化和
+    ``Plan.setpts`` 不应在每个图像分块中重复执行。该对象只负责精确
+    非均匀到均匀模态的变换，不参与 FDA 的均匀采样 FFT 路径。
+    """
+
+    def __init__(
+        self,
+        optical_positions_um: np.ndarray,
+        fft_length: int,
+        eps: float = NUFFT_EPS,
+        max_batch_transforms: int = 8192,
+    ) -> None:
+        positions = np.asarray(optical_positions_um, dtype=np.float32)
+        if positions.ndim != 1 or positions.size < 2:
+            raise ValueError("optical_positions_um must be a 1D array with at least two samples.")
+        if not np.all(np.isfinite(positions)):
+            raise ValueError("optical_positions_um must be finite.")
+        if int(fft_length) < 2:
+            raise ValueError("fft_length must be at least 2.")
+        if not (0.0 < float(eps) < 1.0):
+            raise ValueError("eps must be within (0, 1).")
+        if int(max_batch_transforms) < 1:
+            raise ValueError("max_batch_transforms must be positive.")
+
+        self._positions = np.ascontiguousarray(positions)
+        self._weights = np.ascontiguousarray(_nonuniform_quadrature_weights(positions), dtype=np.float32)
+        self._fft_length = int(fft_length)
+        self._eps = float(eps)
+        self._max_batch_transforms = int(max_batch_transforms)
+        self._mode_count = self._fft_length + 1
+        self._positive_count = self._fft_length // 2 + 1
+        self._plan_cache: dict[int, finufft.Plan] = {}
+        self._plan_build_count = 0
+        self._plan_cache_hit_count = 0
+
+        # 频率轴由最大真实步长确定周期，避免把
+        # 非均匀节点伪装为更高的有效采样率。Type-1 的整数模态刚好对应
+        # k_m = 2πm / period_um。
+        reference_step_um = _estimate_reference_step_um(self._positions, fallback_step_um=1.0)
+        self._period_um = float(self._fft_length) * reference_step_um
+        normalized_nodes = 2.0 * np.pi * self._positions / self._period_um
+        self._nodes = np.ascontiguousarray(
+            ((normalized_nodes + np.pi) % (2.0 * np.pi) - np.pi).astype(np.float32)
+        )
+        self._k_axis = (
+            (2.0 * np.pi / self._period_um)
+            * np.arange(self._positive_count, dtype=np.float32)
+        ).astype(np.float32)
+
+    @property
+    def statistics(self) -> dict[str, int | float]:
+        """返回本上下文的计划构建与缓存命中诊断。"""
+        return {
+            "plan_build_count": self._plan_build_count,
+            "plan_cache_hit_count": self._plan_cache_hit_count,
+            "plan_cache_size": len(self._plan_cache),
+            "fft_length": self._fft_length,
+            "max_batch_transforms": self._max_batch_transforms,
+        }
+
+    def transform_one_sided(self, curves: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """精确计算所有曲线的一侧非均匀采样频谱并返回统一波数轴。"""
+        values = np.asarray(curves, dtype=np.float32)
+        if values.ndim == 1:
+            values = values[None, :]
+        if values.ndim != 2 or values.shape[1] != self._positions.size:
+            raise ValueError("curves must have shape (transform_count, sample_count).")
+        if not np.all(np.isfinite(values)):
+            raise ValueError("curves must contain only finite values.")
+
+        transform_count = values.shape[0]
+        spectrum = np.empty((transform_count, self._positive_count), dtype=np.complex64)
+        for start in range(0, transform_count, self._max_batch_transforms):
+            stop = min(transform_count, start + self._max_batch_transforms)
+            batch_size = stop - start
+            plan = self._get_plan(batch_size)
+            batch = np.ascontiguousarray(values[start:stop] * self._weights[None, :], dtype=np.complex64)
+            transformed = plan.execute(batch)
+            spectrum[start:stop] = np.asarray(transformed[:, : self._positive_count], dtype=np.complex64)
+        return spectrum, self._k_axis.copy()
+
+    def _get_plan(self, batch_size: int) -> finufft.Plan:
+        plan = self._plan_cache.get(int(batch_size))
+        if plan is not None:
+            self._plan_cache_hit_count += 1
+            return plan
+        plan = finufft.Plan(
+            1,
+            (self._mode_count,),
+            n_trans=int(batch_size),
+            eps=self._eps,
+            isign=-1,
+            dtype="complex64",
+            modeord=1,
+        )
+        plan.setpts(self._nodes)
+        self._plan_cache[int(batch_size)] = plan
+        self._plan_build_count += 1
+        return plan
+
+
+def resolve_fft_length(sample_count: int, zero_padding_mode: str = "fixed_512") -> int:
     """
     根据补零模式确定 FFT 长度。
 
     - `none`：不补零，FFT 长度等于原始信号点数。
+    - `fixed_512` / `512`：目标 FFT 长度为 512；若 N 更大，则使用 N 避免截断。
     - `pow2_1`：补到第 1 个严格大于 N 的 2 的幂，例如 130->256、280->512。
     - `pow2_2` / `pow2_3`：继续取后面的 2 的幂，例如 130->512/1024。
     - `factor_2` / `factor_4` / `factor_8`：按固定倍数补零。
@@ -40,6 +148,12 @@ def resolve_fft_length(sample_count: int, zero_padding_mode: str = "next_power_o
     mode = str(zero_padding_mode).strip().lower()
     if mode in {"none", "no", "off", "raw"}:
         return count
+
+    if mode.startswith("fixed_"):
+        fixed_length = int(mode.removeprefix("fixed_"))
+        return max(count, fixed_length)
+    if mode.isdigit():
+        return max(count, int(mode))
 
     # 兼容旧配置名：默认的 next_power_of_two 等价于第 1 个大于 N 的 2 的幂。
     pow2_aliases = {
@@ -404,13 +518,12 @@ def _demean_curves(curves: np.ndarray) -> np.ndarray:
     return curves - np.mean(curves, axis=1, keepdims=True)
 
 
+def _normalize_window_name(window_name: str) -> str:
+    return normalize_window_name(window_name)
+
+
 def _build_window(window_name: str, sample_count: int, window_alpha: float = 0.5) -> np.ndarray:
-    normalized = window_name.strip().lower()
-    if normalized == "none":
-        return np.ones(sample_count, dtype=np.float32)
-    if normalized == "hamming":
-        return np.hamming(sample_count).astype(np.float32)
-    raise ValueError(f"Unsupported window: {window_name}")
+    return build_static_window(window_name, sample_count, window_alpha=window_alpha)
 
 
 def _validate_sample_positions(sample_positions_um: np.ndarray, sample_count: int) -> np.ndarray:
@@ -419,9 +532,40 @@ def _validate_sample_positions(sample_positions_um: np.ndarray, sample_count: in
         raise ValueError("sample_positions_um must be a 1D array with one entry per sample.")
     if not np.all(np.isfinite(positions)):
         raise ValueError("sample_positions_um must contain only finite values.")
-    if np.any(np.diff(positions) <= 0.0):
-        raise ValueError("sample_positions_um must be strictly increasing.")
     return positions
+
+
+def _estimate_reference_step_um(optical_positions_um: np.ndarray, fallback_step_um: float) -> float:
+    """从非均匀 OPD 坐标中估计频谱网格使用的典型参考步长。"""
+    positions = np.asarray(optical_positions_um, dtype=np.float64)
+    diffs = np.diff(positions)
+    nonzero = np.abs(diffs[np.abs(diffs) > 0.0])
+    if nonzero.size > 0:
+        return float(np.median(nonzero))
+    fallback = float(fallback_step_um)
+    if fallback <= 0.0:
+        fallback = 1.0
+    return fallback
+
+
+def _nonuniform_quadrature_weights(optical_positions_um: np.ndarray) -> np.ndarray:
+    """按采集顺序构造归一化积分权重；局部倒退会自然形成带符号权重。"""
+    positions = np.asarray(optical_positions_um, dtype=np.float64)
+    if positions.ndim != 1 or positions.size < 2:
+        raise ValueError("optical_positions_um must be a 1D array with at least two samples.")
+    deltas = np.diff(positions)
+    nonzero = np.abs(deltas[np.abs(deltas) > 0.0])
+    fallback = float(np.median(nonzero)) if nonzero.size else 1.0
+    deltas = np.where(np.abs(deltas) > 0.0, deltas, fallback * 1e-6)
+    weights = np.empty_like(positions, dtype=np.float64)
+    weights[0] = deltas[0]
+    weights[-1] = deltas[-1]
+    if weights.size > 2:
+        weights[1:-1] = 0.5 * (deltas[:-1] + deltas[1:])
+    scale = float(np.median(np.abs(weights[np.abs(weights) > 0.0])))
+    if scale <= 0.0 or not np.isfinite(scale):
+        return np.ones_like(weights, dtype=np.float32)
+    return (weights / scale).astype(np.float32)
 
 
 def _resolve_optical_positions_um(
@@ -460,7 +604,7 @@ def _build_k_axis(
         optical_positions = _resolve_optical_positions_um(sample_count, step_size, sample_positions_um)
         if optical_positions.shape[0] < 2:
             raise ValueError("At least two samples are required.")
-        dz_um = float(np.max(np.diff(optical_positions)))
+        dz_um = _estimate_reference_step_um(optical_positions, fallback_step_um=2.0 * float(step_size))
     fs_um = 1.0 / dz_um
     frequencies = np.arange(0, fft_length // 2 + 1, dtype=np.float32) * (fs_um / float(fft_length))
     return (2.0 * np.pi * frequencies).astype(np.float32)
@@ -483,6 +627,7 @@ def _compute_nonuniform_uniform_grid_spectrum(
     curves: np.ndarray,
     optical_positions_um: np.ndarray,
     fft_length: int,
+    nufft_context: NonuniformNufftContext | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     把非均匀采样曲线投影到统一频率网格上。
@@ -497,16 +642,21 @@ def _compute_nonuniform_uniform_grid_spectrum(
         raise ValueError("optical_positions_um must match the sample dimension of curves.")
     if optical_positions_um.shape[0] < 2:
         raise ValueError("At least two samples are required.")
+    if nufft_context is not None:
+        # 上层为一次非均匀采样分析持有的上下文。复用它可避免每个
+        # 图像分块重新构造 FINUFFT 节点/计划，同时仍然是精确 Type-1 NUFFT。
+        return nufft_context.transform_one_sided(curves)
 
-    dz_ref = float(np.max(np.diff(optical_positions_um)))
+    dz_ref = _estimate_reference_step_um(optical_positions_um, fallback_step_um=1.0)
     period_um = float(fft_length) * dz_ref
     x = (2.0 * np.pi * optical_positions_um / period_um).astype(np.float64)
     x = ((x + np.pi) % (2.0 * np.pi)) - np.pi
 
     n_modes = int(fft_length) + 1
+    weights = _nonuniform_quadrature_weights(optical_positions_um)
     spectrum_full = finufft.nufft1d1(
         x,
-        curves.astype(np.complex128),
+        (curves * weights[None, :]).astype(np.complex128),
         n_modes=(n_modes,),
         isign=-1,
         eps=NUFFT_EPS,
@@ -523,6 +673,7 @@ def _compute_windowed_spectrum(
     curves: np.ndarray,
     step_size: float,
     sample_positions_um: np.ndarray | None = None,
+    nufft_context: NonuniformNufftContext | None = None,
     window_name: str = "hamming",
     window_alpha: float = 0.5,
     fft_length: int | None = None,
@@ -534,13 +685,15 @@ def _compute_windowed_spectrum(
     - 非均匀采样：先转成光程位置，再走统一网格频谱
     """
     fft_length = resolve_fft_length(curves.shape[1]) if fft_length is None else int(fft_length)
-    window = _build_window(window_name, curves.shape[1], window_alpha=window_alpha)
-    windowed = curves * window[None, :]
+    window = build_analysis_window(curves, window_name, window_alpha=window_alpha)
+    windowed = curves * window
     if sample_positions_um is None:
         spectrum = rfft(windowed, n=fft_length, axis=1)
     else:
         optical_positions = _resolve_optical_positions_um(curves.shape[1], step_size, sample_positions_um)
-        spectrum, k_axis = _compute_nonuniform_uniform_grid_spectrum(windowed, optical_positions, fft_length)
+        spectrum, k_axis = _compute_nonuniform_uniform_grid_spectrum(
+            windowed, optical_positions, fft_length, nufft_context=nufft_context
+        )
 
     if sample_positions_um is None:
         amplitude = np.abs(spectrum) / float(fft_length)
@@ -560,6 +713,7 @@ def _compute_one_sided_amplitude(
     window_name: str,
     fft_length: int,
     sample_positions_um: np.ndarray | None = None,
+    nufft_context: NonuniformNufftContext | None = None,
     window_alpha: float = 0.5,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -571,13 +725,15 @@ def _compute_one_sided_amplitude(
 
     这个函数主要给全局 K0 估计使用，因此不返回相位。
     """
-    window = _build_window(window_name, curves.shape[1], window_alpha=window_alpha)
-    windowed = curves * window[None, :]
+    window = build_analysis_window(curves, window_name, window_alpha=window_alpha)
+    windowed = curves * window
     if sample_positions_um is None:
         spectrum = rfft(windowed, n=fft_length, axis=1)
     else:
         optical_positions = _resolve_optical_positions_um(curves.shape[1], step_size, sample_positions_um)
-        spectrum, k_axis = _compute_nonuniform_uniform_grid_spectrum(windowed, optical_positions, fft_length)
+        spectrum, k_axis = _compute_nonuniform_uniform_grid_spectrum(
+            windowed, optical_positions, fft_length, nufft_context=nufft_context
+        )
     if sample_positions_um is None:
         amplitude = np.abs(spectrum) / float(fft_length)
         if amplitude.shape[1] > 2:
@@ -610,9 +766,14 @@ def _select_candidate_curves(intensity_data: np.ndarray, candidate_ratio: float)
     if not (0.0 < ratio <= 1.0):
         raise ValueError("candidate_ratio must be within (0, 1].")
 
-    # 只保留前 `candidate_ratio` 的高质量曲线，抑制坏点对全局谱峰的影响。
+    # 只保留前 `candidate_ratio` 的高质量曲线；候选比例较小时用 argpartition
+    # 避免对所有像素做完整排序，降低大图自动 K0 和自适应窗估计开销。
     candidate_count = max(1, int(np.ceil(valid_curves.shape[0] * ratio)))
-    order = np.argsort(valid_quality)[::-1][:candidate_count]
+    if candidate_count >= valid_curves.shape[0]:
+        order = np.arange(valid_curves.shape[0])
+    else:
+        partial = np.argpartition(valid_quality, -candidate_count)[-candidate_count:]
+        order = partial[np.argsort(valid_quality[partial])[::-1]]
     return valid_curves[order]
 
 
@@ -622,8 +783,9 @@ def estimate_global_k0(
     candidate_ratio: float,
     window_name: str = "hamming",
     window_alpha: float = 0.5,
-    zero_padding_mode: str = "next_power_of_two",
+    zero_padding_mode: str = "fixed_512",
     sample_positions_um: np.ndarray | None = None,
+    nufft_context: NonuniformNufftContext | None = None,
 ) -> dict[str, np.ndarray | float | int | str]:
     """
     自动估计全局 K0。
@@ -637,15 +799,22 @@ def estimate_global_k0(
     if cube.ndim != 3:
         raise ValueError("intensity_data must be a 3D array.")
 
+    fft_length = resolve_fft_length(cube.shape[2], zero_padding_mode)
+    if sample_positions_um is not None and nufft_context is None:
+        optical_positions = _resolve_optical_positions_um(
+            cube.shape[2], step_size, sample_positions_um
+        )
+        nufft_context = NonuniformNufftContext(optical_positions, fft_length)
+
     candidate_curves = _select_candidate_curves(cube, candidate_ratio)
     demeaned = _demean_curves(candidate_curves)
-    fft_length = resolve_fft_length(cube.shape[2], zero_padding_mode)
     amplitude, k_axis = _compute_one_sided_amplitude(
         demeaned,
         step_size=step_size,
         window_name=window_name,
         fft_length=fft_length,
         sample_positions_um=sample_positions_um,
+        nufft_context=nufft_context,
         window_alpha=window_alpha,
     )
     aggregated = np.median(amplitude, axis=0).astype(np.float32)
@@ -667,7 +836,7 @@ def estimate_global_k0(
             peak_index = int(np.argmax(search))
         peak_prominence = 0.0
 
-    return {
+    result = {
         "k_axis": k_axis,
         "spectrum": aggregated,
         "peak_index": peak_index,
@@ -675,11 +844,14 @@ def estimate_global_k0(
         "peak_value": float(aggregated[peak_index]),
         "peak_prominence": peak_prominence,
         "candidate_count": int(candidate_curves.shape[0]),
-        "window_name": window_name.strip().lower(),
+        "window_name": _normalize_window_name(window_name),
         "window_alpha": float(window_alpha),
         "zero_padding_mode": str(zero_padding_mode),
         "fft_length": int(fft_length),
     }
+    if nufft_context is not None:
+        result["nufft_statistics"] = nufft_context.statistics
+    return result
 
 
 def _compute_block(
@@ -773,7 +945,7 @@ def _run_formal_analysis_pipeline(
     phase_gap_method: str = "FDA",
     window_name: str = "hamming",
     window_alpha: float = 0.5,
-    zero_padding_mode: str = "next_power_of_two",
+    zero_padding_mode: str = "fixed_512",
     show_progress: bool = False,
     progress_callback=None,
 ) -> dict[str, np.ndarray]:
@@ -796,7 +968,8 @@ def _run_formal_analysis_pipeline(
     )
 
     method_name = str(phase_gap_method).strip()
-    if method_name.lower() == "fda":
+    method_key = method_name.lower()
+    if method_key in {"fda", "gfda"}:
         merged = dict(baseline_result)
         # FDA 模式直接采用 baseline 层结果：
         # `h` 是斜率高度，`h_prime` 是基于 phi0 + 2πN 的整数级次修正高度。
@@ -805,8 +978,12 @@ def _run_formal_analysis_pipeline(
         merged["heightMap"] = merged["h"]
         merged["heightMap_prime"] = merged["h_prime"]
         merged["phi0"] = merged["phi0_map"]
-        merged["phase_gap_method"] = "FDA"
-        merged["analysis_mode"] = "FDA"
+        if method_key == "gfda":
+            merged["phase_gap_method"] = "GFDA"
+            merged["analysis_mode"] = "GFDA"
+        else:
+            merged["phase_gap_method"] = "FDA"
+            merged["analysis_mode"] = "FDA"
         return merged
 
     from app.core.phase_gap import analyze_phase_gap_maps
@@ -839,7 +1016,7 @@ def analyze_cube_fast(
     phase_gap_method: str = "FDA",
     window_name: str = "hamming",
     window_alpha: float = 0.5,
-    zero_padding_mode: str = "next_power_of_two",
+    zero_padding_mode: str = "fixed_512",
     show_progress: bool = False,
     progress_callback=None,
 ) -> dict[str, np.ndarray]:

@@ -22,14 +22,15 @@ class AnalysisParams:
     folder: Path
     start_height: float
     step_size: float
-    fixed_k0: float
+    fixed_k0: float | None
     window_size: int
     fitting_method: str
     unwrap_method: str
     window_name: str = "hamming"
     window_alpha: float = 0.5
-    zero_padding_mode: str = "next_power_of_two"
+    zero_padding_mode: str = "fixed_512"
     data_source: str = "image_folder"
+    image_intensity_mode: str = "mono12_uint16"
     mat_path: Path | None = None
     phase_gap_method: str = "FDA"
     sampling_mode: str = "uniform"
@@ -37,7 +38,8 @@ class AnalysisParams:
     sample_positions_um: np.ndarray | None = None
     active_range: tuple[int, int] | None = None
     expand_active_range: bool = False
-    active_range_expansion_frames: int = 35
+    active_range_left_expansion_frames: int = 35
+    active_range_right_expansion_frames: int = 35
 
 
 @dataclass(slots=True)
@@ -59,6 +61,17 @@ class AnalysisSession:
             "h": "h.txt",
             "h_prime": "h_prime.txt",
             "phi0": "phi0.txt",
+            "scan_positions_raw_um": "scan_positions_raw_um.txt",
+            "scan_positions_used_um": "scan_positions_used_um.txt",
+            "scan_positions_monotone_um": "scan_positions_monotone_um.txt",
+            "scan_step_raw_um": "scan_step_raw_um.txt",
+            "scan_step_monotone_um": "scan_step_monotone_um.txt",
+            "scan_step_reversal_mask": "scan_step_reversal_mask.txt",
+            "scan_position_correction_um": "scan_position_correction_um.txt",
+            "scan_step_confidence": "scan_step_confidence.txt",
+            "scan_phase_estimated_rad": "scan_phase_estimated_rad.txt",
+            "scan_positions_estimated_raw_um": "scan_positions_estimated_raw_um.txt",
+            "scan_positions_adaptive_correction_um": "scan_positions_adaptive_correction_um.txt",
         }
         alias = {
             "heightMap": "h",
@@ -83,6 +96,12 @@ class AnalysisSession:
                 filename = mapping[key]
                 path = output_dir / filename
             path.parent.mkdir(parents=True, exist_ok=True)
-            np.savetxt(path, exports[key], delimiter="\t")
+            if key in exports:
+                export_values = exports[key]
+            elif key in analysis_result.extras:
+                export_values = np.atleast_1d(np.asarray(analysis_result.extras[key]))
+            else:
+                raise KeyError(f"Result does not contain export key: {requested_key}")
+            np.savetxt(path, export_values, delimiter="\t")
             output_paths[requested_key] = path
         return output_paths

@@ -43,7 +43,8 @@ def load_actual_positions_um(path: Path) -> np.ndarray:
         raise ValueError("Scan log does not contain any actual displacement rows.")
 
     values = np.asarray(positions, dtype=np.float32)
-    # 后续频谱计算要求位移严格递增，否则会破坏非均匀采样频域映射。
+    # scan_log 属于外部非均匀采样输入，仍按原约束要求严格递增；
+    # GFDA 的软件估步长不复用这里的 PZT 反馈路径。
     if not np.all(np.isfinite(values)):
         raise ValueError("Sample positions must be finite.")
     if np.any(np.diff(values) <= 0.0):

@@ -17,20 +17,48 @@ import time
 
 import numpy as np
 
+from app.core.adaptive_window import build_analysis_window
 from app.core.kernel import (
+    NonuniformNufftContext,
     _build_k_axis,
     _compute_windowed_spectrum,
     _custom_phase_unwrap_batch,
+    _nonuniform_quadrature_weights,
     _fit_quadratic_batch,
     _fit_simple_batch,
     _fit_weighted_batch,
     _prepare_local_phase_window,
-    _unwrap_phase_itoh,
     _remove_dc_batch,
     _resolve_block_rows,
+    _resolve_optical_positions_um,
+    _unwrap_phase_itoh,
     estimate_global_k0,
     resolve_fft_length,
 )
+
+
+def _compute_nonuniform_local_spectrum(
+    curves: np.ndarray,
+    *,
+    step_size: float,
+    sample_positions_um: np.ndarray,
+    idx_range_row: np.ndarray,
+    fft_length: int,
+    window_name: str,
+    window_alpha: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """只计算 K0 邻域频点的非均匀 DFT，避免 GFDA 分析浪费在完整频谱上。"""
+    window = build_analysis_window(curves, window_name, window_alpha=window_alpha)
+    windowed = curves * window
+    optical_positions = _resolve_optical_positions_um(curves.shape[1], step_size, sample_positions_um)
+    weights = _nonuniform_quadrature_weights(optical_positions).astype(np.float32)
+    k_axis = _build_k_axis(curves.shape[1], step_size, sample_positions_um, fft_length)
+    k_values = k_axis[idx_range_row].astype(np.float32)
+    basis = np.exp(-1j * optical_positions[:, None].astype(np.float32) * k_values[None, :]).astype(np.complex64)
+    spectrum = (windowed * weights[None, :]).astype(np.float32) @ basis
+    amplitude = np.abs(spectrum) / float(curves.shape[1])
+    phase = np.angle(spectrum)
+    return amplitude.astype(np.float32), phase.astype(np.float32), k_values.astype(np.float32)
 
 
 def build_phase_gap_baseline_maps(
@@ -83,6 +111,7 @@ def _compute_baseline_block(
     global_peak_index: int,
     fixed_k0_value: float,
     sample_positions_um: np.ndarray | None = None,
+    nufft_context: NonuniformNufftContext | None = None,
     window_name: str = "hamming",
     window_alpha: float = 0.5,
     fft_length: int | None = None,
@@ -113,42 +142,62 @@ def _compute_baseline_block(
     # 去直流后，主频峰通常更容易稳定定位，减少低频泄漏对局部拟合的干扰。
     curves = _remove_dc_batch(curves)
 
-    # 对每个像素的扫描曲线做频谱分析，得到幅值、相位和对应的 k 轴。
-    # 这一步仍然只是“逐像素局部信息”，不会再进入全场非 FDA 约束。
-    amplitude, phase, k = _compute_windowed_spectrum(
-        curves,
-        step_size=step_size,
-        sample_positions_um=sample_positions_um,
-        window_name=window_name,
-        window_alpha=window_alpha,
-        fft_length=fft_length,
-    )
-
     # 只截取 k0 附近的小窗口做局部拟合。
     # 这样做的含义是：我们不试图解释整段频谱，只关心名义波数 k0
     # 附近那一小段最能代表“相位截距 phi0”和“局部斜率 g0”的数据。
     # 在全局峰值索引两侧构建对称窗口，窗口总长度为 2*window_size+1。
     offsets = np.arange(-window_size, window_size + 1, dtype=np.int32)
-    idx_range_row = np.clip(global_peak_index + offsets, 0, k.size - 1)
+    full_k_axis = _build_k_axis(
+        sample_count=sample_count,
+        step_size=step_size,
+        sample_positions_um=sample_positions_um,
+        fft_length=fft_length,
+    )
+    idx_range_row = np.clip(global_peak_index + offsets, 0, full_k_axis.size - 1)
     # 为每个像素复制同一组索引窗口，实现完全向量化的批量取样。
     idx_range = np.broadcast_to(idx_range_row, (pixel_count, idx_range_row.shape[0]))
     pixel_index = np.arange(pixel_count)[:, None]
 
-    k_masked = k[idx_range].astype(np.float64)
-    amplitude_masked = amplitude[pixel_index, idx_range].astype(np.float64)
-    # 峰值幅值图常用于后续质量评估或置信度融合。
-    peak_amplitude = amplitude[pixel_index, global_peak_index].astype(np.float64)
+    if sample_positions_um is None:
+        # 对每个像素的扫描曲线做频谱分析，得到幅值、相位和对应的 k 轴。
+        amplitude, phase, k = _compute_windowed_spectrum(
+            curves,
+            step_size=step_size,
+            sample_positions_um=None,
+            nufft_context=nufft_context,
+            window_name=window_name,
+            window_alpha=window_alpha,
+            fft_length=fft_length,
+        )
+        k_masked = k[idx_range].astype(np.float64)
+        amplitude_masked = amplitude[pixel_index, idx_range].astype(np.float64)
+        phase_window = phase[pixel_index, idx_range].astype(np.float64)
+        # 峰值幅值图常用于后续质量评估或置信度融合。
+        peak_amplitude = amplitude[pixel_index, global_peak_index].astype(np.float64)
+    else:
+        amplitude_local, phase_local, k_local = _compute_nonuniform_local_spectrum(
+            curves,
+            step_size=step_size,
+            sample_positions_um=sample_positions_um,
+            idx_range_row=idx_range_row,
+            fft_length=fft_length,
+            window_name=window_name,
+            window_alpha=window_alpha,
+        )
+        k_masked = np.broadcast_to(k_local, (pixel_count, k_local.shape[0])).astype(np.float64)
+        amplitude_masked = amplitude_local.astype(np.float64)
+        phase_window = phase_local.astype(np.float64)
+        peak_column = int(np.argmin(np.abs(idx_range_row - int(global_peak_index))))
+        peak_amplitude = amplitude_local[:, peak_column].astype(np.float64)
     k_center = np.full(pixel_count, float(fixed_k0_value), dtype=np.float64)
 
     # 这里的 unwrap 只服务于局部拟合窗口，不等同于最终表面上的 2D unwrap。
     # baseline 的目标是稳定估出 `phi0` 和 `g0`，再由当前 FDA 公式完成整数级次修正。
     if unwrap_method == "global":
-        phi_unwrapped = np.unwrap(phase, axis=1)
-        phi_masked = phi_unwrapped[pixel_index, idx_range].astype(np.float64)
+        phi_masked = np.unwrap(phase_window, axis=1).astype(np.float64)
     elif unwrap_method == "itoh":
-        phi_masked = _unwrap_phase_itoh(phase[pixel_index, idx_range]).astype(np.float64)
+        phi_masked = _unwrap_phase_itoh(phase_window).astype(np.float64)
     elif unwrap_method in {"local", "gr", "pda", "branch_search"}:
-        phase_window = phase[pixel_index, idx_range].astype(np.float64)
         phi_masked = np.empty_like(phase_window, dtype=np.float64)
         for idx in range(pixel_count):
             local_unwrapped, _, _, _ = _prepare_local_phase_window(
@@ -219,9 +268,10 @@ def analyze_cube_baseline(
     unwrap_method: str,
     fixed_k0_value: float | None = None,
     sample_positions_um: np.ndarray | None = None,
+    nufft_context: NonuniformNufftContext | None = None,
     window_name: str = "hamming",
     window_alpha: float = 0.5,
-    zero_padding_mode: str = "next_power_of_two",
+    zero_padding_mode: str = "fixed_512",
     show_progress: bool = False,
     progress_callback=None,
 ) -> dict[str, np.ndarray]:
@@ -249,6 +299,13 @@ def analyze_cube_baseline(
     peak_amplitude = np.full((height, width), np.nan, dtype=np.float32)
     start_time = time.time()
     fft_length = resolve_fft_length(intensity_data.shape[2], zero_padding_mode)
+    if sample_positions_um is not None and nufft_context is None:
+        # 非均匀坐标的每个像素/分块共享同一组 OPD 节点。这里构造一次，
+        # 后续 K0 搜索和正式分块重建都复用同一个精确 NUFFT 上下文。
+        optical_positions = _resolve_optical_positions_um(
+            intensity_data.shape[2], step_size, sample_positions_um
+        )
+        nufft_context = NonuniformNufftContext(optical_positions, fft_length)
 
     # 构建全局统一的 k 轴：后续所有像素都使用同一个峰值索引窗口。
     k_axis = _build_k_axis(
@@ -267,6 +324,7 @@ def analyze_cube_baseline(
             window_alpha=window_alpha,
             zero_padding_mode=zero_padding_mode,
             sample_positions_um=sample_positions_um,
+            nufft_context=nufft_context,
         )
         global_k0 = float(estimated["k0_value"])
     else:
@@ -306,6 +364,7 @@ def analyze_cube_baseline(
             global_peak_index=global_peak_index,
             fixed_k0_value=global_k0,
             sample_positions_um=sample_positions_um,
+            nufft_context=nufft_context,
             window_name=window_name,
             window_alpha=window_alpha,
             fft_length=fft_length,
@@ -335,7 +394,7 @@ def analyze_cube_baseline(
 
     # 返回中同时保留新旧字段名（例如 h_prime 与 heightMap_prime），
     # 目的是兼容项目中不同阶段/不同入口的调用代码。
-    return {
+    result = {
         "heightMap_coarse": coarse_map,
         "heightMap_prime": height_map_prime,
         "h_coarse": coarse_map,
@@ -349,5 +408,9 @@ def analyze_cube_baseline(
         "k0_index": global_peak_index,
         "k0_value": global_k0,
         "fft_length": int(fft_length),
+        "window_name": str(window_name).strip().lower().replace("-", "_"),
         "zero_padding_mode": str(zero_padding_mode),
     }
+    if nufft_context is not None:
+        result["nufft_statistics"] = nufft_context.statistics
+    return result
