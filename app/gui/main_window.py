@@ -9,8 +9,8 @@ from pathlib import Path
 
 import numpy as np
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
-from PySide6.QtCore import QEvent, Qt, QThread
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import QEvent, QProcess, Qt, QThread, QUrl
+from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractSpinBox,
@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app import APP_NAME, __version__
 from app.core.pixel_analysis import build_pixel_analysis
 from app.core.result_model import AnalysisResult
 from app.gui.fringe_profile_window import FringeProfileWindow
@@ -51,11 +52,12 @@ from app.gui.surface_analysis_page import PlaneAnalysisPage, StepAnalysisPage
 from app.gui.theme import ThemeMode, build_stylesheet, resolve_theme_mode
 from app.gui.widgets import SectionHeader, StatusPill, StepButton
 from app.pipeline.io import collect_image_files
-from app.gui.worker import AnalysisWorker, GlobalK0Worker
+from app.gui.worker import AnalysisWorker, GlobalK0Worker, UpdateCheckWorker, UpdateDownloadWorker
 from app.pipeline.scan_log import load_actual_positions_um
 from app.pipeline.session import AnalysisParams, AnalysisSession
 from app.plotting.paper import save_paper_figures
 from app.plotting.preview import ComparisonCanvas, HeatmapCanvas, SpectrumCanvas, SurfaceCanvas
+from app.update_checker import UpdateInfo
 
 TAU = 2.0 * np.pi
 GFDA_SOFTWARE_METHODS = {"gfda_carrier_phase", "gfda_scatter_fit"}
@@ -159,8 +161,10 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         """初始化状态字段并构建整套界面。"""
         super().__init__()
-        self.setWindowTitle("FDA_Antivib")
+        self.setWindowTitle(APP_NAME)
         self._thread: QThread | None = None
+        self._update_thread: QThread | None = None
+        self._update_worker: object | None = None
         self._worker: AnalysisWorker | None = None
         self._k0_worker: GlobalK0Worker | None = None
         self._result: AnalysisResult | None = None
@@ -221,6 +225,10 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(12, 6, 12, 6)
         layout.setSpacing(10)
 
+        brand = QLabel(APP_NAME)
+        brand.setObjectName("BrandText")
+        layout.addWidget(brand, 0)
+
         self.global_nav_group = QButtonGroup(self)
         self.global_nav_group.setExclusive(True)
         self.global_nav_buttons: list[QPushButton] = []
@@ -234,6 +242,11 @@ class MainWindow(QMainWindow):
             layout.addWidget(button, 0)
 
         layout.addStretch(1)
+        self.update_button = QPushButton("检查更新")
+        self.update_button.setObjectName("TopNavButton")
+        self.update_button.setToolTip(f"当前版本 {__version__}，检查 GitHub Releases 中的新版本。")
+        self.update_button.clicked.connect(self._check_for_updates)
+        layout.addWidget(self.update_button, 0)
         return bar
 
     def _build_workbench_page(self) -> QWidget:
@@ -2184,6 +2197,108 @@ class MainWindow(QMainWindow):
         else:
             window.show()
         window.raise_()
+
+    def _check_for_updates(self) -> None:
+        """启动后台更新检查，避免网络请求阻塞 GUI。"""
+        if self._update_thread is not None and self._update_thread.isRunning():
+            QMessageBox.information(self, "检查更新", "已有更新任务正在运行。")
+            return
+        self.update_button.setEnabled(False)
+        self.update_button.setText("检查中")
+        self._append_log(f"正在检查更新，当前版本 {__version__}。")
+        self._start_update_worker(UpdateCheckWorker(__version__), "check")
+
+    def _start_update_worker(self, worker: object, task: str) -> None:
+        """创建更新线程；检查与下载共用同一套生命周期管理。"""
+        thread = QThread(self)
+        self._update_thread = thread
+        self._update_worker = worker
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        if task == "check":
+            worker.finished.connect(self._handle_update_check_finished)
+        else:
+            worker.progress.connect(self._handle_update_download_progress)
+            worker.finished.connect(self._handle_update_download_finished)
+        worker.failed.connect(self._handle_update_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._finalize_update_thread)
+        thread.start()
+
+    def _finalize_update_thread(self) -> None:
+        """恢复更新按钮状态并释放 worker 引用。"""
+        self._update_thread = None
+        self._update_worker = None
+        if hasattr(self, "update_button"):
+            self.update_button.setEnabled(True)
+            self.update_button.setText("检查更新")
+
+    def _handle_update_check_finished(self, info: object) -> None:
+        """展示更新检查结果，并在用户确认后下载更新包。"""
+        update_info = info if isinstance(info, UpdateInfo) else None
+        if update_info is None:
+            QMessageBox.warning(self, "检查更新", "更新结果格式异常。")
+            return
+        if not update_info.update_available:
+            QMessageBox.information(self, "检查更新", f"当前已是最新版本：{update_info.current_version}")
+            self._append_log(f"当前已是最新版本：{update_info.current_version}")
+            return
+        if not update_info.download_url or not update_info.asset_name:
+            button = QMessageBox.question(
+                self,
+                "发现新版本",
+                f"发现新版本 {update_info.latest_version}，但该 Release 没有可自动下载的安装包。\n是否打开发布页面？",
+            )
+            if button == QMessageBox.Yes and update_info.release_url:
+                QDesktopServices.openUrl(QUrl(update_info.release_url))
+            return
+
+        cached_hint = "\n本机已有完整缓存，将直接复用。" if update_info.cached_path is not None else ""
+        button = QMessageBox.question(
+            self,
+            "发现新版本",
+            (
+                f"当前版本：{update_info.current_version}\n"
+                f"最新版本：{update_info.latest_version}\n"
+                f"安装包：{update_info.asset_name}{cached_hint}\n\n"
+                "是否现在下载并安装？"
+            ),
+        )
+        if button != QMessageBox.Yes:
+            self._append_log(f"发现新版本 {update_info.latest_version}，用户暂不更新。")
+            return
+        self.update_button.setEnabled(False)
+        self.update_button.setText("下载中")
+        self._append_log(f"开始下载更新包：{update_info.asset_name}")
+        self._start_update_worker(UpdateDownloadWorker(update_info), "download")
+
+    def _handle_update_download_progress(self, percent: int) -> None:
+        """刷新更新下载进度。"""
+        value = max(0, min(int(percent), 100))
+        self.update_button.setText(f"下载 {value}%")
+
+    def _handle_update_download_finished(self, path: object) -> None:
+        """下载完成后运行安装器。"""
+        installer_path = Path(path)
+        self._append_log(f"更新包已就绪：{installer_path}")
+        button = QMessageBox.question(
+            self,
+            "更新包已就绪",
+            "安装器已下载完成。是否现在运行安装器并关闭当前程序？",
+        )
+        if button == QMessageBox.Yes:
+            if QProcess.startDetached(str(installer_path), []):
+                QApplication.quit()
+            else:
+                QMessageBox.warning(self, "启动失败", f"无法启动安装器：{installer_path}")
+
+    def _handle_update_failed(self, message: str) -> None:
+        """展示更新失败原因。"""
+        QMessageBox.warning(self, "检查更新失败", message)
+        self._append_log(f"检查更新失败：{message}")
 
     def closeEvent(self, event) -> None:
         """关闭主窗口前停止 PyVista 渲染并释放 VTK/OpenGL 资源。"""

@@ -16,6 +16,7 @@ from PySide6.QtCore import QObject, Signal, Slot
 from app.core.kernel import analyze_cube_fast, estimate_global_k0
 from app.core.result_model import AnalysisResult
 from app.core.software_scan_steps import estimate_software_scan_positions
+from app.update_checker import UpdateInfo, check_latest_update, download_update
 from app.pipeline.active_range import apply_active_range, apply_known_active_range
 from app.pipeline.io import collect_image_files, load_intensity_cube, load_mat_intensity_cube
 from app.pipeline.scan_log import load_actual_positions_um
@@ -362,5 +363,44 @@ class GlobalK0Worker(QObject):
             self.log.emit(f"\u5168\u5c40 K0 \u4f30\u8ba1\u5b8c\u6210\uff0cFFT长度={int(result.get('fft_length', cube.shape[2]))}\u3002")
             self.finished.emit(result)
             self.progress.emit(100)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class UpdateCheckWorker(QObject):
+    """在线更新检查 worker。"""
+
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, current_version: str) -> None:
+        super().__init__()
+        self.current_version = current_version
+
+    @Slot()
+    def run(self) -> None:
+        """查询 GitHub Releases 最新版本。"""
+        try:
+            self.finished.emit(check_latest_update(self.current_version))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class UpdateDownloadWorker(QObject):
+    """更新包下载 worker。"""
+
+    progress = Signal(int)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, update_info: UpdateInfo) -> None:
+        super().__init__()
+        self.update_info = update_info
+
+    @Slot()
+    def run(self) -> None:
+        """下载或复用已缓存的安装包。"""
+        try:
+            self.finished.emit(download_update(self.update_info, self.progress.emit))
         except Exception as exc:
             self.failed.emit(str(exc))

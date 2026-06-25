@@ -7,14 +7,19 @@ from __future__ import annotations
 - 启动事件循环
 """
 
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
+from app import APP_NAME
 from app.gui.main_window import MainWindow
+from app.runtime_paths import resource_path
 
 
 def main() -> int:
     """创建并启动 GUI，返回 Qt 事件循环退出码。"""
     app = QApplication.instance() or QApplication([])
+    app.setApplicationName(APP_NAME)
+    app.setWindowIcon(QIcon(str(resource_path("assets/app_icon.ico"))))
     window = MainWindow()
     window.resize(1400, 900)
     window.show()
