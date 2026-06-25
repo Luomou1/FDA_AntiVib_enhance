@@ -94,7 +94,7 @@ def check_latest_update(current_version: str) -> UpdateInfo:
         release = _request_json(RELEASE_API_URL)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
-            raise RuntimeError("GitHub Releases 中还没有可用版本。") from exc
+            raise RuntimeError("未找到公开 Release；若仓库是私有仓库，在线更新需要公开 Release 或配置公开更新源。") from exc
         raise RuntimeError(f"检查更新失败：HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"检查更新失败：{exc.reason}") from exc

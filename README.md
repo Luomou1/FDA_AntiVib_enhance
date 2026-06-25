@@ -121,6 +121,8 @@ powershell -ExecutionPolicy Bypass -File scripts\build_windows_exe.ps1
 2. 上传 `数据分析-0.1.1-setup.exe` 或其他 `.exe` / `.msi` / `.zip` 安装包资产
 3. 客户端发现远程版本高于当前版本后才下载；已下载且大小一致的安装包会直接复用
 
+在线更新请求不内置 GitHub Token。若仓库保持私有，普通客户端无法读取 Release API；需要将 Release 所在仓库设为公开，或改为公开的更新清单/下载源。
+
 ## 当前状态
 
 当前仓库主要聚焦于桌面 GUI 与核心分析流程的工程化整理，适合作为后续继续补充测试、样例数据、批处理脚本和算法验证基线的起点。
