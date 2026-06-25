@@ -17,6 +17,14 @@ from app import APP_NAME
 
 RELEASE_API_URL = "https://api.github.com/repos/Luomou1/FDA_AntiVib_enhance/releases/latest"
 USER_AGENT = "FDA-AntiVib-enhance-updater"
+INSTALLER_PATTERNS = (
+    "DataAnalysis-*-setup.exe",
+    "DataAnalysis-*-setup.exe.part",
+    "FDA_AntiVib_enhance-*-setup.exe",
+    "FDA_AntiVib_enhance-*-setup.exe.part",
+    "数据分析-*-setup.exe",
+    "数据分析-*-setup.exe.part",
+)
 
 
 @dataclass(frozen=True)
@@ -86,6 +94,42 @@ def update_cache_dir() -> Path:
     path = root / APP_NAME / "updates"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _normalized_version(version: str) -> tuple[int, ...]:
+    parts = _version_parts(version)
+    return parts + (0,) * (4 - len(parts))
+
+
+def _installer_version_from_name(name: str) -> str | None:
+    match = re.search(r"v?(\d+(?:\.\d+){1,3})", name)
+    return match.group(1) if match else None
+
+
+def cleanup_cached_installers(current_version: str, roots: list[Path] | None = None) -> list[Path]:
+    """清理旧安装包缓存，只处理本应用命名的安装包文件。"""
+    cleanup_roots = roots if roots is not None else [Path(tempfile.gettempdir()), update_cache_dir()]
+    current = _normalized_version(current_version)
+    removed: list[Path] = []
+    seen: set[Path] = set()
+    for root in cleanup_roots:
+        if not root.exists() or not root.is_dir():
+            continue
+        for pattern in INSTALLER_PATTERNS:
+            for path in root.glob(pattern):
+                resolved = path.resolve()
+                if resolved in seen or not path.is_file():
+                    continue
+                seen.add(resolved)
+                version = _installer_version_from_name(path.name)
+                should_remove = path.suffix == ".part" or version is None or _normalized_version(version) != current
+                if should_remove:
+                    try:
+                        path.unlink()
+                        removed.append(path)
+                    except OSError:
+                        continue
+    return removed
 
 
 def check_latest_update(current_version: str) -> UpdateInfo:

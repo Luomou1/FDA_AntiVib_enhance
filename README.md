@@ -123,6 +123,8 @@ powershell -ExecutionPolicy Bypass -File scripts\build_windows_exe.ps1
 
 在线更新请求不内置 GitHub Token。若仓库保持私有，普通客户端无法读取 Release API；需要将 Release 所在仓库设为公开，或改为公开的更新清单/下载源。
 
+程序启动时会清理 `%TEMP%` 和本应用更新缓存中的旧版安装包，只保留当前版本的本应用安装包，并删除未完成的 `.part` 下载文件。构建脚本成功生成安装器后，会自动清理 `dist\installer` 下的旧 `.exe`，只保留最新安装器。
+
 ## 当前状态
 
 当前仓库主要聚焦于桌面 GUI 与核心分析流程的工程化整理，适合作为后续继续补充测试、样例数据、批处理脚本和算法验证基线的起点。
