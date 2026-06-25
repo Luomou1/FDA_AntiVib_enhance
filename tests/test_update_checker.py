@@ -22,7 +22,7 @@ def test_pick_release_asset_prefers_installer_exe() -> None:
     assert asset["name"] == "数据分析-0.1.1-setup.exe"
 
 
-def test_cleanup_cached_installers_keeps_current_version(tmp_path) -> None:
+def test_cleanup_cached_installers_removes_all_app_installers(tmp_path) -> None:
     current = tmp_path / "DataAnalysis-0.1.0-setup.exe"
     old = tmp_path / "DataAnalysis-0.0.9-setup.exe"
     partial = tmp_path / "数据分析-0.1.0-setup.exe.part"
@@ -30,10 +30,10 @@ def test_cleanup_cached_installers_keeps_current_version(tmp_path) -> None:
     for path in (current, old, partial, unrelated):
         path.write_text("placeholder", encoding="utf-8")
 
-    removed = cleanup_cached_installers("0.1.0", roots=[tmp_path])
+    removed = cleanup_cached_installers(roots=[tmp_path])
 
-    assert current.exists()
     assert unrelated.exists()
+    assert not current.exists()
     assert not old.exists()
     assert not partial.exists()
-    assert {path.name for path in removed} == {old.name, partial.name}
+    assert {path.name for path in removed} == {current.name, old.name, partial.name}

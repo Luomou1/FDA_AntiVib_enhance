@@ -123,7 +123,15 @@ powershell -ExecutionPolicy Bypass -File scripts\build_windows_exe.ps1
 
 在线更新请求不内置 GitHub Token。若仓库保持私有，普通客户端无法读取 Release API；需要将 Release 所在仓库设为公开，或改为公开的更新清单/下载源。
 
-程序启动时会清理 `%TEMP%` 和本应用更新缓存中的旧版安装包，只保留当前版本的本应用安装包，并删除未完成的 `.part` 下载文件。构建脚本成功生成安装器后，会自动清理 `dist\installer` 下的旧 `.exe`，只保留最新安装器。
+程序启动时会清理 `%TEMP%` 和本应用更新缓存中的本应用安装包，并删除未完成的 `.part` 下载文件；不会扫描或删除其他软件的安装包。构建脚本成功生成安装器后，会自动清理 `dist\installer` 下的旧 `.exe`，只保留最新安装器。
+
+如果需要上传 Release 安装包，使用：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\upload_release_installer.ps1 -Tag v0.1.0
+```
+
+该脚本会把最新安装器复制到系统临时目录，以 `DataAnalysis-版本号-setup.exe` 的英文文件名上传，上传完成后删除临时副本，不在项目目录里遗留额外安装包。
 
 ## 当前状态
 

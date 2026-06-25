@@ -12,7 +12,7 @@ import sys
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
-from app import APP_NAME, __version__
+from app import APP_NAME
 from app.runtime_paths import resource_path
 from app.update_checker import cleanup_cached_installers
 
@@ -26,7 +26,7 @@ def main(argv: list[str] | None = None) -> int:
         _ = MainWindow
         return 0
 
-    cleanup_cached_installers(__version__)
+    cleanup_cached_installers()
 
     from app.gui.main_window import MainWindow
 

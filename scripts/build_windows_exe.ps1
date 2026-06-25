@@ -17,7 +17,9 @@ function Remove-OldInstallerExe {
     }
 
     $installers = Get-ChildItem -Path $InstallerDir -Filter "*.exe" -File |
-        Sort-Object LastWriteTimeUtc -Descending
+        Sort-Object @{ Expression = "LastWriteTimeUtc"; Descending = $true },
+            @{ Expression = { if ($_.Name -like "数据分析-*-setup.exe") { 0 } else { 1 } }; Ascending = $true },
+            @{ Expression = "Name"; Ascending = $true }
 
     if ($installers.Count -le 1) {
         return

@@ -96,20 +96,9 @@ def update_cache_dir() -> Path:
     return path
 
 
-def _normalized_version(version: str) -> tuple[int, ...]:
-    parts = _version_parts(version)
-    return parts + (0,) * (4 - len(parts))
-
-
-def _installer_version_from_name(name: str) -> str | None:
-    match = re.search(r"v?(\d+(?:\.\d+){1,3})", name)
-    return match.group(1) if match else None
-
-
-def cleanup_cached_installers(current_version: str, roots: list[Path] | None = None) -> list[Path]:
-    """清理旧安装包缓存，只处理本应用命名的安装包文件。"""
+def cleanup_cached_installers(roots: list[Path] | None = None) -> list[Path]:
+    """清理本应用安装包缓存，只处理本应用命名的安装包文件。"""
     cleanup_roots = roots if roots is not None else [Path(tempfile.gettempdir()), update_cache_dir()]
-    current = _normalized_version(current_version)
     removed: list[Path] = []
     seen: set[Path] = set()
     for root in cleanup_roots:
@@ -121,14 +110,11 @@ def cleanup_cached_installers(current_version: str, roots: list[Path] | None = N
                 if resolved in seen or not path.is_file():
                     continue
                 seen.add(resolved)
-                version = _installer_version_from_name(path.name)
-                should_remove = path.suffix == ".part" or version is None or _normalized_version(version) != current
-                if should_remove:
-                    try:
-                        path.unlink()
-                        removed.append(path)
-                    except OSError:
-                        continue
+                try:
+                    path.unlink()
+                    removed.append(path)
+                except OSError:
+                    continue
     return removed
 
 
