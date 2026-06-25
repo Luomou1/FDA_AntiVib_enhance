@@ -121,7 +121,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build_windows_exe.ps1
 2. 上传 `数据分析-0.1.1-setup.exe` 或其他 `.exe` / `.msi` / `.zip` 安装包资产
 3. 客户端发现远程版本高于当前版本后才下载；已下载且大小一致的安装包会直接复用
 
-在线更新请求不内置 GitHub Token。若仓库保持私有，普通客户端无法读取 Release API；需要将 Release 所在仓库设为公开，或改为公开的更新清单/下载源。
+在线更新请求不内置 GitHub Token，当前依赖公开仓库 `Luomou1/FDA_AntiVib_enhance` 的 GitHub Releases。仓库保持公开后，普通客户端可以直接读取最新版本信息和安装包资产。
 
 程序启动时会清理 `%TEMP%` 和本应用更新缓存中的本应用安装包，并删除未完成的 `.part` 下载文件；不会扫描或删除其他软件的安装包。构建脚本成功生成安装器后，会自动清理 `dist\installer` 下的旧 `.exe`，只保留最新安装器。
 
