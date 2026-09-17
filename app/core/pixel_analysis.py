@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from app.core.adaptive_window import build_analysis_window
+from app.core.adaptive_window import build_analysis_window, normalize_window_name
 from app.core.kernel import (
     _build_k_axis,
     _compute_nonuniform_uniform_grid_spectrum,
@@ -124,7 +124,12 @@ def build_pixel_analysis(
         )
         spectrum = spectrum[0]
     if sample_positions_um is None:
-        amplitude = np.abs(spectrum).astype(np.float32) / float(fft_length)
+        normalization_count = (
+            signal_windowed.shape[0]
+            if normalize_window_name(window_name) == "none"
+            else fft_length
+        )
+        amplitude = np.abs(spectrum).astype(np.float32) / float(normalization_count)
         if amplitude.shape[0] > 2:
             amplitude[1:-1] *= 2.0
     else:

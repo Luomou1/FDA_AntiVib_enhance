@@ -109,3 +109,20 @@ def test_denoised_layer_statistics_use_processed_sample_standard_deviation() -> 
 
     assert result.layer_stats["low"]["std"] == pytest.approx(np.std(low_values, ddof=1))
     assert result.layer_stats["high"]["std"] == pytest.approx(np.std(high_values, ddof=1))
+
+
+@pytest.mark.parametrize("method", ["simple", "robust", "quadratic"])
+def test_plane_without_denoise_preserves_spikes_and_only_calibrates(method) -> None:
+    y, x = np.mgrid[:40, :50]
+    data = 0.4 * x - 0.2 * y + 50.0
+    data[8, 12] += 500.0
+
+    result = analyze_plane(data, method=method, denoise=False)
+
+    np.testing.assert_array_equal(data, result.original)
+    expected = data - result.fitted_surface
+    expected += np.mean(data) - np.mean(expected)
+    np.testing.assert_allclose(expected, result.processed)
+    assert result.outlier_count == 0
+    assert result.noise_count == 0
+    assert np.ptp(result.processed) > 400.0

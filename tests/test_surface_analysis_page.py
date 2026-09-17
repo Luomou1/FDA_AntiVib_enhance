@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from app.gui.surface_analysis_page import (
     PlaneAnalysisPage,
@@ -32,9 +33,9 @@ def test_step_page_exposes_denoise_and_no_denoise_modes(qtbot) -> None:
     page = StepAnalysisPage()
     qtbot.addWidget(page)
 
-    assert page.mode_combo.count() == 2
-    assert page.mode_combo.itemData(0) == "denoise"
-    assert page.mode_combo.itemData(1) == "raw"
+    assert page.denoise_checkbox.isChecked()
+    page.denoise_checkbox.setChecked(False)
+    assert not page.denoise_checkbox.isChecked()
     assert not page.analyze_button.isEnabled()
 
 
@@ -145,7 +146,8 @@ def test_plane_and_step_use_pyvista_for_3d_surfaces(qtbot) -> None:
     assert isinstance(step_page.processed_surface_canvas, Surface3DCanvas)
 
 
-def test_plane_page_runs_one_independent_height_file(qtbot, tmp_path) -> None:
+@pytest.mark.parametrize("denoise", [True, False])
+def test_plane_page_runs_one_independent_height_file(qtbot, tmp_path, denoise) -> None:
     y, x = np.mgrid[:24, :30]
     data = 0.4 * x - 0.2 * y + 50.0 + 0.5 * np.sin(x / 4.0)
     path = tmp_path / "plane.txt"
@@ -154,16 +156,21 @@ def test_plane_page_runs_one_independent_height_file(qtbot, tmp_path) -> None:
     page = PlaneAnalysisPage()
     qtbot.addWidget(page)
     page.file_edit.setText(str(path))
+    page.denoise_checkbox.setChecked(denoise)
     page._run_analysis()
     qtbot.waitUntil(lambda: page._result is not None and page._analysis_thread is None, timeout=8000)
 
     assert page._result is not None
     assert page._result.original.shape == data.shape
+    if not denoise:
+        np.testing.assert_array_equal(data, page._result.original)
+        assert page._result.noise_count == 0
     assert "高度范围" in page.metrics.toPlainText()
     assert page._rendered_tabs == {2}
 
 
-def test_step_page_runs_and_measures_regions_with_same_three_points(qtbot, tmp_path) -> None:
+@pytest.mark.parametrize("denoise", [True, False])
+def test_step_page_runs_and_measures_regions_with_same_three_points(qtbot, tmp_path, denoise) -> None:
     y, x = np.mgrid[:36, :48]
     data = 0.1 * x - 0.08 * y + np.where(x >= 24, 40.0, 0.0)
     path = tmp_path / "step.txt"
@@ -175,10 +182,12 @@ def test_step_page_runs_and_measures_regions_with_same_three_points(qtbot, tmp_p
     page._load_for_selection()
     page.selection_canvas._points = [(5, 5), (28, 8), (12, 20)]
     page._on_points_changed(page.selection_canvas.points)
+    page.denoise_checkbox.setChecked(denoise)
     page._run_analysis()
     qtbot.waitUntil(lambda: page._result is not None and page._analysis_thread is None, timeout=8000)
 
     assert page._result is not None
+    assert page._result.denoised == denoise
     assert page.analyze_button.isEnabled()
     assert page._rendered_tabs == set()
 

@@ -696,7 +696,12 @@ def _compute_windowed_spectrum(
         )
 
     if sample_positions_um is None:
-        amplitude = np.abs(spectrum) / float(fft_length)
+        normalization_count = (
+            curves.shape[1]
+            if normalize_window_name(window_name) == "none"
+            else fft_length
+        )
+        amplitude = np.abs(spectrum) / float(normalization_count)
         if amplitude.shape[1] > 2:
             amplitude[:, 1:-1] *= 2.0
     else:
@@ -735,7 +740,12 @@ def _compute_one_sided_amplitude(
             windowed, optical_positions, fft_length, nufft_context=nufft_context
         )
     if sample_positions_um is None:
-        amplitude = np.abs(spectrum) / float(fft_length)
+        normalization_count = (
+            curves.shape[1]
+            if normalize_window_name(window_name) == "none"
+            else fft_length
+        )
+        amplitude = np.abs(spectrum) / float(normalization_count)
         if amplitude.shape[1] > 2:
             amplitude[:, 1:-1] *= 2.0
     else:

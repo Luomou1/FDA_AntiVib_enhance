@@ -277,23 +277,26 @@ def _surface_stats(data: np.ndarray) -> dict[str, float]:
     }
 
 
-def analyze_plane(data: np.ndarray, method: str = "simple") -> PlaneAnalysisResult:
-    """执行单个平面高度矩阵的异常点修复、表面校准和残余去噪。"""
+def analyze_plane(data: np.ndarray, method: str = "simple", denoise: bool = True) -> PlaneAnalysisResult:
+    """执行表面校准，并按选择决定是否修复异常点和去除残余噪声。"""
     matrix = fill_nan_local_median(data)
 
-    initial_coefficients, initial_surface = _fit_plane(matrix)
-    residuals = matrix - initial_surface
-    mad_value = _mad(residuals)
-    outlier_threshold = max(8.0 * mad_value, np.finfo(float).eps)
-    outlier_mask = np.abs(residuals - np.median(residuals)) > outlier_threshold
-    cleaned = _repair_masked_values(
-        matrix,
-        outlier_mask,
-        fallback=initial_surface,
-        window_sizes=(5, 7, 9),
-        large_area=30,
-        gaussian_sigma=2.0,
-    )
+    outlier_mask = np.zeros_like(matrix, dtype=bool)
+    cleaned = matrix.copy()
+    if denoise:
+        initial_coefficients, initial_surface = _fit_plane(matrix)
+        residuals = matrix - initial_surface
+        mad_value = _mad(residuals)
+        outlier_threshold = max(8.0 * mad_value, np.finfo(float).eps)
+        outlier_mask = np.abs(residuals - np.median(residuals)) > outlier_threshold
+        cleaned = _repair_masked_values(
+            matrix,
+            outlier_mask,
+            fallback=initial_surface,
+            window_sizes=(5, 7, 9),
+            large_area=30,
+            gaussian_sigma=2.0,
+        )
 
     normalized_method = method.strip().lower()
     if normalized_method == "simple":
@@ -306,20 +309,23 @@ def analyze_plane(data: np.ndarray, method: str = "simple") -> PlaneAnalysisResu
         raise ValueError(f"未知平面校准方法：{method}")
 
     calibrated = cleaned - fitted_surface
-    calibrated_mean = float(np.mean(calibrated))
-    calibrated_std = float(np.std(calibrated))
-    if calibrated_std <= np.finfo(float).eps:
-        noise_mask = np.zeros_like(calibrated, dtype=bool)
-    else:
-        noise_mask = np.abs(calibrated - calibrated_mean) > 5.0 * calibrated_std
-    denoised = _repair_masked_values(
-        calibrated,
-        noise_mask,
-        fallback=calibrated_mean,
-        window_sizes=(3, 5, 7),
-        large_area=30,
-        gaussian_sigma=1.5,
-    )
+    noise_mask = np.zeros_like(calibrated, dtype=bool)
+    denoised = calibrated.copy()
+    if denoise:
+        calibrated_mean = float(np.mean(calibrated))
+        calibrated_std = float(np.std(calibrated))
+        if calibrated_std <= np.finfo(float).eps:
+            noise_mask = np.zeros_like(calibrated, dtype=bool)
+        else:
+            noise_mask = np.abs(calibrated - calibrated_mean) > 5.0 * calibrated_std
+        denoised = _repair_masked_values(
+            calibrated,
+            noise_mask,
+            fallback=calibrated_mean,
+            window_sizes=(3, 5, 7),
+            large_area=30,
+            gaussian_sigma=1.5,
+        )
 
     # MATLAB 程序在去倾斜后恢复原始平均高度；这样校准只改变形貌，不改变绝对高度基准。
     denoised += float(np.mean(cleaned) - np.mean(denoised))

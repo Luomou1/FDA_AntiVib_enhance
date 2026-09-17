@@ -3,7 +3,8 @@ from __future__ import annotations
 import numpy as np
 
 from app.core.adaptive_window import build_analysis_window, normalize_window_name
-from app.core.kernel import _compute_windowed_spectrum
+from app.core.kernel import _compute_one_sided_amplitude, _compute_windowed_spectrum
+from app.core.pixel_analysis import build_pixel_analysis
 
 
 def _make_shifted_interferogram(sample_count: int, center: float, left_sigma: float, right_sigma: float) -> np.ndarray:
@@ -72,3 +73,68 @@ def test_adaptive_window_is_used_by_windowed_spectrum_entry() -> None:
     assert phase.shape == amplitude.shape
     assert k_axis.shape == (65,)
     assert np.all(np.isfinite(amplitude))
+
+
+def test_unwindowed_uniform_spectrum_normalizes_by_original_sample_count() -> None:
+    """均匀无窗频谱的幅值不应因补零长度变化。"""
+    sample_count = 64
+    sample_index = np.arange(sample_count, dtype=np.float32)
+    curve = 2.0 * np.cos(2.0 * np.pi * 5.0 * sample_index / sample_count)
+    curves = curve[None, :]
+
+    amplitude_raw, _, _ = _compute_windowed_spectrum(
+        curves,
+        step_size=0.05,
+        window_name="none",
+        fft_length=sample_count,
+    )
+    amplitude_padded, _, _ = _compute_windowed_spectrum(
+        curves,
+        step_size=0.05,
+        window_name="none",
+        fft_length=sample_count * 2,
+    )
+    one_sided_raw, _ = _compute_one_sided_amplitude(
+        curves,
+        step_size=0.05,
+        window_name="none",
+        fft_length=sample_count,
+    )
+    one_sided_padded, _ = _compute_one_sided_amplitude(
+        curves,
+        step_size=0.05,
+        window_name="none",
+        fft_length=sample_count * 2,
+    )
+
+    np.testing.assert_allclose(amplitude_raw[0, 5], 2.0, rtol=1e-6)
+    np.testing.assert_allclose(amplitude_padded[0, 10], 2.0, rtol=1e-6)
+    np.testing.assert_allclose(one_sided_raw[0, 5], 2.0, rtol=1e-6)
+    np.testing.assert_allclose(one_sided_padded[0, 10], 2.0, rtol=1e-6)
+
+
+def test_unwindowed_pixel_spectrum_normalizes_by_original_sample_count() -> None:
+    """单像素无窗频谱的幅值不应因补零长度变化。"""
+    sample_count = 64
+    sample_index = np.arange(sample_count, dtype=np.float32)
+    cube = (2.0 * np.cos(2.0 * np.pi * 5.0 * sample_index / sample_count))[None, None, :]
+
+    analysis_raw = build_pixel_analysis(
+        cube,
+        x=0,
+        y=0,
+        step_size=0.05,
+        window_name="none",
+        zero_padding_mode="none",
+    )
+    analysis_padded = build_pixel_analysis(
+        cube,
+        x=0,
+        y=0,
+        step_size=0.05,
+        window_name="none",
+        zero_padding_mode="128",
+    )
+
+    np.testing.assert_allclose(np.asarray(analysis_raw["amplitude_y"])[5], 2.0, rtol=1e-6)
+    np.testing.assert_allclose(np.asarray(analysis_padded["amplitude_y"])[10], 2.0, rtol=1e-6)

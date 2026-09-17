@@ -13,6 +13,7 @@ from pyvistaqt import QtInteractor
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -603,17 +604,18 @@ class _PlaneAnalysisWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, path: str, conversion_factor: float, method: str) -> None:
+    def __init__(self, path: str, conversion_factor: float, method: str, denoise: bool = True) -> None:
         super().__init__()
         self._path = path
         self._conversion_factor = float(conversion_factor)
         self._method = method
+        self._denoise = denoise
 
     @Slot()
     def run(self) -> None:
         try:
             matrix = load_height_matrix(self._path, self._conversion_factor)
-            self.finished.emit(analyze_plane(matrix, method=self._method))
+            self.finished.emit(analyze_plane(matrix, method=self._method, denoise=self._denoise))
         except Exception as exc:  # pragma: no cover - failure path is exercised through GUI state.
             self.failed.emit(str(exc))
 
@@ -698,6 +700,10 @@ class PlaneAnalysisPage(QFrame):
         self.method_combo.addItem("二次曲面校准", "quadratic")
         form.addRow("校准方法", self.method_combo)
 
+        self.denoise_checkbox = QCheckBox("去噪")
+        self.denoise_checkbox.setChecked(True)
+        form.addRow("处理模式", self.denoise_checkbox)
+
         self.profile_combo = QComboBox()
         self.profile_combo.addItem("行轮廓", "row")
         self.profile_combo.addItem("列轮廓", "column")
@@ -743,6 +749,7 @@ class PlaneAnalysisPage(QFrame):
             self.file_edit.text().strip(),
             self.conversion_factor.value(),
             str(self.method_combo.currentData()),
+            self.denoise_checkbox.isChecked(),
         )
         self._analysis_worker.moveToThread(self._analysis_thread)
         self._analysis_thread.started.connect(self._analysis_worker.run)
@@ -803,7 +810,7 @@ class PlaneAnalysisPage(QFrame):
         elif index == 1:
             self.processed_surface_canvas.draw_surface(
                 self._result.processed,
-                "校正并去噪后三维形貌",
+                "处理后三维形貌",
                 z_limits=_height_limits(self._result.original),
             )
         elif index == 2:
@@ -912,10 +919,9 @@ class StepAnalysisPage(QFrame):
         self.conversion_factor.valueChanged.connect(lambda _value: self._invalidate_input())
         form.addRow("换算系数", self.conversion_factor)
 
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItem("去噪", "denoise")
-        self.mode_combo.addItem("不去噪", "raw")
-        form.addRow("处理模式", self.mode_combo)
+        self.denoise_checkbox = QCheckBox("去噪")
+        self.denoise_checkbox.setChecked(True)
+        form.addRow("处理模式", self.denoise_checkbox)
 
         self.profile_combo = QComboBox()
         self.profile_combo.addItem("行轮廓", "row")
@@ -1004,12 +1010,12 @@ class StepAnalysisPage(QFrame):
         if self._matrix is None or len(self.selection_canvas.points) != 3 or self._analysis_thread is not None:
             return
         self.analyze_button.setEnabled(False)
-        self.status_label.setText("正在后台执行台阶调平、分层和去噪，界面可继续响应。")
+        self.status_label.setText("正在后台执行台阶分析，界面可继续响应。")
         self._analysis_thread = QThread(self)
         self._analysis_worker = _StepAnalysisWorker(
             self._matrix,
             self.selection_canvas.points,
-            str(self.mode_combo.currentData()) == "denoise",
+            self.denoise_checkbox.isChecked(),
         )
         self._analysis_worker.moveToThread(self._analysis_thread)
         self._analysis_thread.started.connect(self._analysis_worker.run)
