@@ -1,5 +1,5 @@
 #define MyAppName "数据分析"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.1.2"
 #define MyAppPublisher "Luomou1"
 #define MyAppExeName "数据分析.exe"
 
