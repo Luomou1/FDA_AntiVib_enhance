@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
-from PySide6.QtCore import QEvent, QProcess, Qt, QThread, QUrl
+from PySide6.QtCore import QEvent, QProcess, QProcessEnvironment, Qt, QThread, QUrl
 from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
@@ -2290,7 +2290,14 @@ class MainWindow(QMainWindow):
             "安装器已下载完成。是否现在运行安装器并关闭当前程序？",
         )
         if button == QMessageBox.Yes:
-            if QProcess.startDetached(str(installer_path), []):
+            # 安装器及其启动的新版本必须重新解压，不能复用旧进程退出后会删除的 _MEI 目录。
+            environment = QProcessEnvironment.systemEnvironment()
+            environment.insert("PYINSTALLER_RESET_ENVIRONMENT", "1")
+            process = QProcess()
+            process.setProgram(str(installer_path))
+            process.setProcessEnvironment(environment)
+            started = process.startDetached()
+            if started:
                 QApplication.quit()
             else:
                 QMessageBox.warning(self, "启动失败", f"无法启动安装器：{installer_path}")

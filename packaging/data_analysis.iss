@@ -30,4 +30,5 @@ Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent
+; 在原用户进程内设置标志，避免安装器提权前后的环境隔离使设置失效。
+Filename: "{cmd}"; Parameters: "/D /S /C ""set ""PYINSTALLER_RESET_ENVIRONMENT=1"" && ""{app}\{#MyAppExeName}"""""; Description: "启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent runhidden
