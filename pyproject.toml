@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 [project]
 # 项目元数据当前主要服务于依赖声明与 CI 安装，不额外展开打包发布配置。
 name = "fda-antivib"
-version = "0.1.0"
+version = "1.0.0"
 description = "带自动有效扫描范围确认的白光扫描干涉 FDA/PhaseGap 分析桌面项目"
 readme = "README.md"
 requires-python = ">=3.11"
