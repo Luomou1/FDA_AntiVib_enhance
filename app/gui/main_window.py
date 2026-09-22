@@ -674,6 +674,7 @@ class MainWindow(QMainWindow):
         self.unwrap.addItem("全局解包裹", "global")
         self.unwrap.addItem("Itoh 局部解包裹", "itoh")
         self.unwrap.addItem("GR 解包裹", "gr")
+        self.unwrap.addItem("metro", "metro")
         self.unwrap.addItem("PDA 局部解包裹", "pda")
         self.unwrap.addItem("Branch Search 局部解包裹", "branch_search")
         self.unwrap.setCurrentIndex(self.unwrap.findData("itoh"))
@@ -1185,6 +1186,7 @@ class MainWindow(QMainWindow):
         self.unwrap.addItem("全局解包裹", "global")
         self.unwrap.addItem("Itoh 局部解包裹", "itoh")
         self.unwrap.addItem("GR 解包裹", "gr")
+        self.unwrap.addItem("metro", "metro")
         self.unwrap.addItem("PDA 局部解包裹", "pda")
         self.unwrap.addItem("Branch Search 局部解包裹", "branch_search")
         self.unwrap.setCurrentIndex(self.unwrap.findData("itoh"))
@@ -1371,6 +1373,7 @@ class MainWindow(QMainWindow):
         self.unwrap.addItem("全局解包裹", "global")
         self.unwrap.addItem("Itoh 局部解包裹", "itoh")
         self.unwrap.addItem("GR 解包裹", "gr")
+        self.unwrap.addItem("metro", "metro")
         self.unwrap.addItem("PDA 局部解包裹", "pda")
         self.unwrap.addItem("Branch Search 局部解包裹", "branch_search")
         self.unwrap.setCurrentIndex(self.unwrap.findData("itoh"))
@@ -2424,6 +2427,14 @@ class MainWindow(QMainWindow):
 
         if self._pixel_window is None:
             self._pixel_window = PixelAnalysisWindow(self)
+            self._pixel_window.coordinate_requested.connect(
+                lambda selected_layer, selected_x, selected_y: self._handle_pixel_click(
+                    selected_layer, {"x": selected_x, "y": selected_y}
+                )
+            )
+        self._pixel_window.set_coordinate_range(
+            width=self._analysis_cube.shape[1], height=self._analysis_cube.shape[0]
+        )
         self._present_aux_window(self._pixel_window)
 
         analysis = build_pixel_analysis(

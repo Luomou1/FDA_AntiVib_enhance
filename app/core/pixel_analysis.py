@@ -11,6 +11,7 @@ from __future__ import annotations
 """
 
 import numpy as np
+from app.core.metro_unwrap import unwrap_metro
 
 from app.core.adaptive_window import build_analysis_window, normalize_window_name
 from app.core.kernel import (
@@ -47,6 +48,16 @@ def _fit_phase_segment(
     fitting_method: str,
 ) -> np.ndarray:
     """对单像素局部窗口生成拟合相位曲线（仅返回曲线，不返回参数）。"""
+    if not np.all(np.isfinite(phi_masked)):
+        valid = np.isfinite(phi_masked) & np.isfinite(amplitude_masked)
+        if np.unique(k_masked[valid]).size < 3:
+            return np.full_like(k_masked, np.nan, dtype=np.float32)
+        if fitting_method not in {"simple", "weighted", "quadratic"}:
+            raise ValueError(f"Unsupported fitting method: {fitting_method}")
+        coeff = np.polyfit(k_masked[valid] - k_center, phi_masked[valid],
+                           2 if fitting_method == "quadratic" else 1,
+                           w=amplitude_masked[valid] if fitting_method == "weighted" else None)
+        return np.polyval(coeff, k_masked - k_center).astype(np.float32)
     if fitting_method == "simple":
         coeffs = np.polyfit(k_masked, phi_masked, deg=1)
         return np.polyval(coeffs, k_masked).astype(np.float32)
@@ -139,7 +150,7 @@ def build_pixel_analysis(
     # 局部拟合时会按分支策略再次取局部窗口处理。
     if unwrap_method == "global":
         phase_unwrapped = np.unwrap(phase_raw).astype(np.float32)
-    elif unwrap_method in {"itoh", "gr", "pda", "branch_search", "local"}:
+    elif unwrap_method in {"itoh", "gr", "pda", "branch_search", "local", "metro"}:
         phase_unwrapped = phase_raw.copy()
     else:
         raise ValueError(f"Unsupported unwrap method: {unwrap_method}")
@@ -177,8 +188,12 @@ def build_pixel_analysis(
             k_center=float(k0_x),
             fitting_method=fitting_method,
         )
-    elif unwrap_method == "itoh":
-        fit_mask_phase_y = _unwrap_phase_itoh(phase_raw[idx_range]).astype(np.float32)
+    elif unwrap_method in {"itoh", "metro"}:
+        fit_mask_phase_y = (
+            unwrap_metro(phase_raw[idx_range], fit_mask_amplitude_y, idx_range)
+            if unwrap_method == "metro"
+            else _unwrap_phase_itoh(phase_raw[idx_range])
+        ).astype(np.float32)
         fit_phase_y = _fit_phase_segment(
             k_masked=fit_mask_k_x.astype(np.float64),
             phi_masked=fit_mask_phase_y.astype(np.float64),

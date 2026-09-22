@@ -16,6 +16,7 @@ FDA 级次估计的中间量，便于排查 `h_prime` 的整周期选择是否�
 import time
 
 import numpy as np
+from app.core.metro_unwrap import unwrap_metro
 
 from app.core.adaptive_window import build_analysis_window
 from app.core.kernel import (
@@ -193,7 +194,9 @@ def _compute_baseline_block(
 
     # 这里的 unwrap 只服务于局部拟合窗口，不等同于最终表面上的 2D unwrap。
     # baseline 的目标是稳定估出 `phi0` 和 `g0`，再由当前 FDA 公式完成整数级次修正。
-    if unwrap_method == "global":
+    if unwrap_method == "metro":
+        phi_masked = unwrap_metro(phase_window, amplitude_masked, idx_range_row)
+    elif unwrap_method == "global":
         phi_masked = np.unwrap(phase_window, axis=1).astype(np.float64)
     elif unwrap_method == "itoh":
         phi_masked = _unwrap_phase_itoh(phase_window).astype(np.float64)
@@ -214,7 +217,22 @@ def _compute_baseline_block(
     # 统一输出两类局部参数：
     # - `g0`: 局部斜率（dphi/dk）
     # - `phi0`: 在 k0 处的相位截距
-    if fitting_method == "simple":
+    if unwrap_method == "metro" and not np.all(np.isfinite(phi_masked)):
+        # 截止后的频点不参与拟合；至少保留三个不同波数，避免伪造有效高度。
+        g0 = np.full(pixel_count, np.nan)
+        phi0 = np.full(pixel_count, np.nan)
+        if fitting_method not in {"simple", "weighted", "quadratic"}:
+            raise ValueError(f"Unsupported fitting method: {fitting_method}")
+        for pixel in range(pixel_count):
+            mask = np.isfinite(phi_masked[pixel])
+            if np.unique(k_masked[pixel, mask]).size < 3:
+                continue
+            x = k_masked[pixel, mask] - k_center[pixel]
+            weights = amplitude_masked[pixel, mask] if fitting_method == "weighted" else None
+            coeff = np.polyfit(x, phi_masked[pixel, mask],
+                               2 if fitting_method == "quadratic" else 1, w=weights)
+            g0[pixel], phi0[pixel] = coeff[-2:]
+    elif fitting_method == "simple":
         g0, phi0 = _fit_simple_batch(k_masked, phi_masked, k_center)
     elif fitting_method == "quadratic":
         g0, phi0 = _fit_quadratic_batch(k_masked, phi_masked, k_center)

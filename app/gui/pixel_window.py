@@ -9,8 +9,8 @@ import matplotlib as mpl
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QLabel, QMainWindow, QVBoxLayout, QWidget
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QMainWindow, QPushButton, QSpinBox, QVBoxLayout, QWidget
 
 from app.gui.mpl_font import configure_matplotlib_fonts
 
@@ -29,10 +29,13 @@ def _set_data_xlim_from_zero(axes, x_values: np.ndarray) -> None:
 class PixelAnalysisWindow(QMainWindow):
     """承载单像素信号与频谱分析图组的独立窗口。"""
 
+    coordinate_requested = Signal(str, int, int)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("\u50cf\u7d20\u5206\u6790")
         self.setWindowFlag(Qt.Tool, True)
+        self._layer_name = ""
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -43,6 +46,22 @@ class PixelAnalysisWindow(QMainWindow):
 
         self.header_label = QLabel("\u8bf7\u9009\u62e9\u4e00\u4e2a\u50cf\u7d20\u70b9")
         layout.addWidget(self.header_label)
+        coordinate_layout = QHBoxLayout()
+        coordinate_layout.addWidget(QLabel("像素坐标（从 0 开始）"))
+        self.x_coordinate_spin = QSpinBox()
+        self.y_coordinate_spin = QSpinBox()
+        for name, spin in (("X", self.x_coordinate_spin), ("Y", self.y_coordinate_spin)):
+            spin.setPrefix(f"{name} ")
+            spin.setAccessibleName(f"{name} 像素坐标")
+            spin.setRange(0, 0)
+            spin.setEnabled(False)
+            coordinate_layout.addWidget(spin)
+        self.jump_to_pixel_button = QPushButton("查看像素")
+        self.jump_to_pixel_button.setEnabled(False)
+        self.jump_to_pixel_button.clicked.connect(self._request_coordinate)
+        coordinate_layout.addWidget(self.jump_to_pixel_button)
+        coordinate_layout.addStretch()
+        layout.addLayout(coordinate_layout)
 
         # 弹窗首次刷新时可能尚未真正显示，手动布局比 constrained_layout
         # 更适合嵌入式 Qt 画布，避免零尺寸 canvas 触发布局警告。
@@ -60,8 +79,25 @@ class PixelAnalysisWindow(QMainWindow):
         layout.addWidget(self.toolbar)
         layout.addWidget(self.canvas, 1)
 
+    def set_coordinate_range(self, width: int, height: int) -> None:
+        """将可选坐标限制在当前分析图像内。"""
+        self.x_coordinate_spin.setRange(0, width - 1)
+        self.y_coordinate_spin.setRange(0, height - 1)
+        self.x_coordinate_spin.setEnabled(True)
+        self.y_coordinate_spin.setEnabled(True)
+        self.jump_to_pixel_button.setEnabled(True)
+
+    def _request_coordinate(self) -> None:
+        """沿用当前图层，请主窗口重新计算指定像素。"""
+        self.coordinate_requested.emit(
+            self._layer_name, self.x_coordinate_spin.value(), self.y_coordinate_spin.value()
+        )
+
     def update_analysis(self, payload: dict, layer_name: str, fitting_method: str, unwrap_method: str) -> None:
         """用新像素分析结果刷新整套图形与标题说明。"""
+        self._layer_name = layer_name
+        self.x_coordinate_spin.setValue(int(payload["x"]))
+        self.y_coordinate_spin.setValue(int(payload["y"]))
         self.header_label.setText(
             f"\u56fe\u5c42: {layer_name} | x={payload['x']}, y={payload['y']} | "
             f"\u62df\u5408={fitting_method} | \u89e3\u5305\u88f9={unwrap_method}"
